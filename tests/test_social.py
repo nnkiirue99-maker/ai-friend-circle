@@ -568,3 +568,33 @@ def test_friends_likes_and_comments_do_not_vanish_after_the_cache_lease(nodes):
     # The same holds for the AI the author controls, and for a friend reading the thread.
     b_seen = {x["id"] for x in b.social.thread(b.person, mine["id"])["items"]}
     assert {like["id"], comment["id"]} <= b_seen
+
+
+def test_notifications_cover_own_and_own_ai_posts_with_text_time_and_unread(nodes):
+    a, b, _, _ = nodes
+    connect(a, b)
+    mine = post(a, "我的动态")
+    ai_post = post(a, "AI 的动态", a.ai)
+    drain(a, b)
+    b.social.refresh(b.person, a.person)
+    b.social.refresh(b.person, a.ai)
+    b.social.interact(b.person, b.person, mine["id"], "like")
+    b.social.interact(b.person, b.person, mine["id"], "comment", "好看")
+    b.social.interact(b.ai, b.ai, ai_post["id"], "comment", "你好呀")
+    a.social.interact(a.person, a.person, mine["id"], "like")  # my own like is not a notification
+    drain(a, b)
+    result = a.social.notifications(a.person)
+    kinds = sorted((n["kind"], n["text"]) for n in result["items"])
+    assert kinds == [("comment", "你好呀"), ("comment", "好看"), ("like", None)]
+    assert result["unread"] == 3 and all(n["unread"] and n["time"] for n in result["items"])
+    assert {n["post"]["id"] for n in result["items"]} == {mine["id"], ai_post["id"]}
+    a.social.mark_notifications_seen(a.person, max(n["id"] for n in result["items"]))
+    assert a.social.notifications(a.person)["unread"] == 0
+    second = b.social.interact(b.person, b.person, mine["id"], "comment", "再来一条")
+    drain(a, b)
+    assert a.social.notifications(a.person)["unread"] == 1
+    b.social.delete(b.person, second["id"])  # a withdrawn comment disappears from the list
+    drain(a, b)
+    assert "再来一条" not in str(a.social.notifications(a.person))
+    with pytest.raises(FederationError):
+        a.social.notifications(a.ai)  # notifications belong to the human account

@@ -210,7 +210,9 @@ def test_v5_migration_keeps_identity_friendship_posts_and_credentials(nodes):
             db.execute("DROP TABLE " + table)
         db.execute("UPDATE metadata SET value='5' WHERE key='schema'")
     restored = Federation(a.config, a.http)
-    assert restored.store.one("SELECT value FROM metadata WHERE key='schema'")[0] == "6"
+    from friend_circle.migrations import LATEST
+
+    assert restored.store.one("SELECT value FROM metadata WHERE key='schema'")[0] == str(LATEST)
     assert restored.social.object(b.person, shared["id"])["content"]["text"] == "迁移前"
     assert restored.relationships.is_friend(a.person, b.person)
     assert restored.identity.private_key(a.ai)

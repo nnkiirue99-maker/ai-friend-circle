@@ -129,6 +129,7 @@
     },
     async revokeInvitation(id) { await call('/invitations/revoke', { id }); },
     async deleteInvitation(id) { await call('/invitations/delete', { id }); },
+    async markNotificationsSeen(upTo) { await call('/notifications/seen', { up_to: upTo }); },
     async clearInvitations() { await call('/invitations/clear', {}); },
     async requestFriend(value) {
       const text = String(value || '').trim();

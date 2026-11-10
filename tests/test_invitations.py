@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from friend_circle.errors import FederationError
+from friend_circle.migrations import LATEST
 from friend_circle.invitations import parse
 from friend_circle.service import Federation
 from test_relationships import drain
@@ -118,7 +119,7 @@ def test_migration_preserves_actor_notes_and_relationships(nodes):
     assert restored.relationships.is_friend(a.person, b.person)
     assert restored.relationships.contacts(a.person)[0]["note"] == "朋友"
     assert restored.identity.private_key(a.person)
-    assert restored.store.one("SELECT value FROM metadata WHERE key='schema'")[0] == "6"
+    assert restored.store.one("SELECT value FROM metadata WHERE key='schema'")[0] == str(LATEST)
 
 
 def test_real_tls_bidirectional_invitation(tmp_path):

@@ -566,8 +566,8 @@ class Social:
             )
             if self.local(owner):
                 db.execute(
-                    "INSERT INTO social_references VALUES (?,?,?,?)",
-                    (root, identifier, actor, kind),
+                    "INSERT INTO social_references(root,id,actor,kind,received) VALUES (?,?,?,?,?)",
+                    (root, identifier, actor, kind, time.time()),
                 )
                 self._notify_root(db, root)
             else:
@@ -1050,10 +1050,91 @@ class Social:
             )
         if obj["kind"] != "post":
             db.execute(
-                "INSERT OR IGNORE INTO social_references VALUES (?,?,?,?)",
-                (obj["root"], identifier, obj["actor"], obj["kind"]),
+                "INSERT OR IGNORE INTO social_references(root,id,actor,kind,received) VALUES (?,?,?,?,?)",
+                (obj["root"], identifier, obj["actor"], obj["kind"], time.time()),
             )
             self._notify_root(db, obj["root"])
+
+    def notifications(self, human, before=None, limit=20):
+        """Likes and comments others left under posts by this human or the AIs it controls,
+        newest first, with the comment text, the time and the post, plus the unread count."""
+        self.s.relationships._human(human)
+        cursor = page(before, limit)
+        authors = self.own_authors(human)
+        marks = ",".join("?" * len(authors))
+        base = (
+            "FROM social_references r JOIN social_objects o ON o.id=r.root "
+            f"WHERE o.actor IN ({marks}) AND o.deleted=0 AND r.actor NOT IN ({marks})"
+        )
+        rows = self.store.all(
+            "SELECT r.rowid AS seq,r.id,r.actor,r.kind,r.root,r.received "
+            + base
+            + " AND r.rowid<? ORDER BY r.rowid DESC LIMIT ?",
+            (*authors, *authors, cursor, limit + 1),
+        )
+        seen = self.store.one(
+            "SELECT value FROM metadata WHERE key=?", ("notifications-seen:" + human,)
+        )
+        seen = int(seen[0]) if seen else 0
+        unread = self.store.one(
+            "SELECT count(*) " + base + " AND r.rowid>?", (*authors, *authors, seen)
+        )[0]
+        items = []
+        for row in rows[:limit]:
+            text, when = None, row["received"]
+            if row["kind"] == "comment":
+                cached = self.store.one(
+                    f"SELECT body FROM object_cache WHERE id=? AND reader IN ({marks})",
+                    (row["id"], *authors),
+                )
+                try:
+                    body = (
+                        decode(cached[0])
+                        if cached
+                        else self.fetch(actor_of(row["root"]), row["id"])
+                    )
+                except FederationError as exc:
+                    if exc.status < 500:
+                        continue  # withdrawn or no longer permitted: say nothing about it
+                    body = None
+                except OSError:
+                    body = None
+                if body:
+                    text, when = body["content"]["text"], when or body.get("published")
+            try:
+                post = self.object(human, row["root"])
+            except FederationError:
+                continue
+            items.append(
+                {
+                    "id": row["seq"],
+                    "actor": row["actor"],
+                    "kind": row["kind"],
+                    "comment_id": row["id"] if row["kind"] == "comment" else None,
+                    "text": text,
+                    "time": when,
+                    "unread": row["seq"] > seen,
+                    "post": post,
+                }
+            )
+        return {
+            "items": items,
+            "unread": unread,
+            "next_cursor": rows[limit - 1]["seq"] if len(rows) > limit else None,
+        }
+
+    def mark_notifications_seen(self, human, up_to):
+        self.s.relationships._human(human)
+        if type(up_to) is not int or not 0 <= up_to < 2**63:
+            raise FederationError("invalid_cursor")
+        key = "notifications-seen:" + human
+        with self.store.connect(write=True) as db:
+            current = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if not current or int(current[0]) < up_to:
+                db.execute(
+                    "INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(up_to)),
+                )
 
     def _thread_resync_due(self, reader, root):
         key = "thread-sync:" + reader + " " + root

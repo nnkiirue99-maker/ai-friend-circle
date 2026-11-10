@@ -58,6 +58,16 @@ CREATE TABLE post_groups(object_id TEXT NOT NULL REFERENCES social_objects(id),
  group_id TEXT NOT NULL REFERENCES audience_groups(id), PRIMARY KEY(object_id,group_id));
 CREATE INDEX post_groups_group ON post_groups(group_id,object_id);
 """
+
+
+def _v7(db):
+    # When a like or comment arrived, for notifications. Idempotent: re-running is harmless.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(social_references)")}
+    if "received" not in columns:
+        db.execute("ALTER TABLE social_references ADD COLUMN received REAL")
+
+
+MIGRATIONS[7] = _v7
 LATEST = max(MIGRATIONS)
 
 
@@ -70,7 +80,8 @@ def statements(db, script):
 
 def migrate(db, previous):
     for version in range(max(2, previous) + 1, LATEST + 1):
-        statements(db, MIGRATIONS[version])
+        step = MIGRATIONS[version]
+        step(db) if callable(step) else statements(db, step)
     db.execute(
         "INSERT INTO metadata VALUES ('schema',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(LATEST),),

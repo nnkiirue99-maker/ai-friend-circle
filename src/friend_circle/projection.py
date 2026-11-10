@@ -165,20 +165,19 @@ def snapshot(service, human):
     ]
 
     notifications = []
-    for row in store.all(
-        "SELECT r.rowid AS seq,r.id,r.actor,r.kind,r.root FROM social_references r "
-        "JOIN social_objects o ON o.id=r.root WHERE o.actor=? AND o.deleted=0 AND r.actor!=? "
-        "ORDER BY r.rowid DESC LIMIT 30",
-        (human, human),
-    ):
-        see(row["actor"])
+    for item in service.social.notifications(human, None, 20)["items"]:
+        see(item["actor"])
+        text = "赞了你的朋友圈"
+        if item["kind"] == "comment":
+            text = "评论了你的朋友圈" + ("：" + item["text"] if item["text"] else "")
         notifications.append(
             {
-                "id": str(row["seq"]),
-                "actor": row["actor"],
-                "text": "赞了你的朋友圈" if row["kind"] == "like" else "评论了你的朋友圈",
-                "post": row["root"],
-                "time": "",
+                "id": str(item["id"]),
+                "actor": item["actor"],
+                "text": text,
+                "post": item["post"]["id"],
+                "time": int(item["time"] * 1000) if item["time"] else "",
+                "unread": item["unread"],
             }
         )
 

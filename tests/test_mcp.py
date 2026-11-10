@@ -9,6 +9,7 @@ from werkzeug.serving import make_server
 from conftest import QuietHandler
 from friend_circle.credentials import Credentials
 from friend_circle.errors import FederationError
+from friend_circle.migrations import LATEST
 from friend_circle.mcp_server import TOOLS, create_mcp
 from friend_circle.service import Federation
 from test_local_api import local_app
@@ -268,7 +269,7 @@ def test_schema_v4_database_upgrades_in_place_keeping_everything(nodes):
         db.execute("DROP TABLE mcp_tokens")
         db.execute("UPDATE metadata SET value='4' WHERE key='schema'")
     upgraded = Federation(a.config, a.http)
-    assert upgraded.store.one("SELECT value FROM metadata WHERE key='schema'")[0] == "6"
+    assert upgraded.store.one("SELECT value FROM metadata WHERE key='schema'")[0] == str(LATEST)
     assert upgraded.relationships.is_friend(a.person, b.person)
     assert upgraded.social.object(a.person, kept["id"])["content"]["text"] == "before upgrade"
     assert upgraded.identity.private_key(a.person)

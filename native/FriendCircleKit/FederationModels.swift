@@ -70,6 +70,17 @@ struct FederationInvitationPreview: Decodable { let actor_id: String; let origin
 struct FederationThread: Decodable { let root: String; let items: [FederationObject]; let next_cursor: Int? }
 struct FederationPolicy: Decodable { let actor_id: String; let visible_days: Int?; let revision: Int }
 struct FederationOK: Decodable { let ok: Bool? }
+/// A like or comment someone left under a post by me or by an AI I control.
+struct FederationNotification: Decodable, Identifiable {
+    let id: Int
+    let actor: String
+    let kind: String
+    let comment_id: String?
+    let text: String?
+    let time: Double?
+    var unread: Bool
+    let post: FederationObject
+}
 struct FederationActorRoute: Hashable { let id: String }
 struct FederationAPIError: LocalizedError {
     let status: Int
@@ -109,7 +120,7 @@ struct FederationAPIError: LocalizedError {
     /// Posts deleted in this session; every list hides them at once without a reload.
     @Published var deletedPosts = Set<String>()
     // Never cache private posts to UserDefaults or disk. The server owns authorized caches.
-    func reset() { me = nil; ownActors = []; contacts = []; friendGroups = []; groupCandidates = []; actors = [:]; notes = [:]; ready = false }
+    func reset() { me = nil; ownActors = []; contacts = []; friendGroups = []; groupCandidates = []; actors = [:]; notes = [:]; notifications = []; unreadNotifications = 0; notificationCursor = nil; ready = false }
     func name(_ actor: String) -> String {
         if let note = notes[actor], !note.isEmpty { return note }
         if let profile = actors[actor], profile.lease_until.map({ $0 > Date().timeIntervalSince1970 }) ?? true { return profile.name }
@@ -204,6 +215,32 @@ struct FederationAPIError: LocalizedError {
     func refreshContacts() async {
         guard ready, !busy else { return }
         try? await loadContacts()
+        await refreshUnread()
+    }
+    // MARK: Social notifications
+    @Published var notifications: [FederationNotification] = []
+    @Published var unreadNotifications = 0
+    @Published var notificationCursor: Int?
+    private struct NotificationPage: Decodable { let items: [FederationNotification]; let unread: Int; let next_cursor: Int? }
+    func loadNotifications(more: Bool = false) async throws {
+        let query = more ? "?before=\(notificationCursor ?? Int.max)&limit=20" : "?limit=20"
+        let page: NotificationPage = try await FederationNotificationsAPI.fetch(query)
+        notifications = more ? notifications + page.items : page.items
+        notificationCursor = page.next_cursor; unreadNotifications = page.unread
+        for actor in Set(page.items.map(\.actor)) where actors[actor] == nil {
+            if let profile = try? await profile(actor) { actors[actor] = profile.profile }
+        }
+    }
+    func refreshUnread() async {
+        guard ready, let page: NotificationPage = try? await FederationNotificationsAPI.fetch("?limit=1") else { return }
+        unreadNotifications = page.unread
+    }
+    func markNotificationsSeen() async {
+        guard let top = notifications.map(\.id).max(), unreadNotifications > 0 else { return }
+        let ok: FederationOK? = try? await FCAPI.shared.federation("/notifications/seen", body: ["up_to": top])
+        guard ok != nil else { return }
+        unreadNotifications = 0
+        for index in notifications.indices { notifications[index].unread = false }
     }
     func isFriend(_ actor: String) -> Bool { contacts.contains { $0.status == "active" && ($0.remote_human == actor || $0.remote_ai.contains(actor)) } }
 }
@@ -234,5 +271,11 @@ enum FederationPendingInvitation {
         guard status == errSecItemNotFound else { return false }
         var item = lookup; item[kSecValueData as String] = data; item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+}
+
+enum FederationNotificationsAPI {
+    static func fetch<T: Decodable>(_ query: String) async throws -> T {
+        try await FCAPI.shared.federation("/notifications" + query)
     }
 }

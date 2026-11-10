@@ -275,6 +275,23 @@ def make_blueprint(service, principal, ui_origin):
         service.invitations.revoke(principal(), field(data(), "id"))
         return jsonify(ok=True)
 
+    @bp.get("/notifications")
+    def notifications():
+        try:
+            before = int(request.args["before"]) if "before" in request.args else None
+            limit = int(request.args.get("limit", "20"))
+        except ValueError as exc:
+            raise FederationError("invalid_pagination") from exc
+        return jsonify(service.social.notifications(principal(), before, limit))
+
+    @bp.post("/notifications/seen")
+    def notifications_seen():
+        obj = data()
+        if set(obj) != {"up_to"}:
+            raise FederationError("invalid_request")
+        service.social.mark_notifications_seen(principal(), obj["up_to"])
+        return jsonify(ok=True)
+
     @bp.post("/invitations/delete")
     def invitation_delete():
         service.invitations.delete(principal(), field(data(), "id"))

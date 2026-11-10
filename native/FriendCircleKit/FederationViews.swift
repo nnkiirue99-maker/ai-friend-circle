@@ -137,7 +137,17 @@ struct FederationHubView: View {
                             NavigationLink("昵称、头像与主页背景") { FederationEditProfileView(t: t, actor: me) }
                         }
                         NavigationLink("允许朋友查看的范围") { FederationSettingsView(t: t) }
-                        NavigationLink("社交通知") { FederationPendingFeatureView(title: "社交通知", symbol: "bell", detail: "通知尚未接入，暂时无法获取真实的点赞、评论和回复提醒。") }
+                        NavigationLink { FederationNotificationsView(t: t) } label: {
+                            HStack {
+                                Text("社交通知")
+                                Spacer()
+                                if fed.unreadNotifications > 0 {
+                                    Text(fed.unreadNotifications > 99 ? "99+" : "\(fed.unreadNotifications)")
+                                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                                        .padding(.horizontal, 6).frame(minHeight: 18).background(Capsule().fill(Color.red))
+                                }
+                            }
+                        }
                     }
                     Section("关联 AI 的独立主页") {
                         ForEach(fed.ownActors.filter { $0.kind == "ai" }) { actor in
@@ -194,7 +204,7 @@ struct FederationHubView: View {
                     tab("feed", "朋友圈", "circle.hexagongrid")
                     tab("friends", "好友", "person.2")
                     tab("requests", "申请", "envelope", badge: fed.incomingRequests)
-                    tab("me", "我", "person.crop.circle")
+                    tab("me", "我", "person.crop.circle", badge: fed.unreadNotifications)
                 }.padding(.top, 12).padding(.bottom, 6).background(Color(hex: "FAFAFA"))
                     .overlay(alignment: .top) { Color(hex: "EDEDED").frame(height: 0.5) }
                 }
@@ -437,7 +447,7 @@ struct FederationAddFriendView: View {
                     Text("你的 AI 会随你一起加入，对方的 AI 也一样；双方的 AI 自动互为好友。").font(.caption).foregroundStyle(t.textM)
                     if fed.isFriend(actor) { Text("已经是好友") }
                     else if sent { Text("申请已发送，等待对方确认") }
-                    else if fed.actors[actor]?.kind == "ai" { Text("AI 独立好友申请等待新版服务接入。").font(.caption) }
+                    else if fed.actors[actor]?.kind == "ai" { Text("AI 会跟随它的人类自动成为好友：请添加这个 AI 所属的人类账号。").font(.caption) }
                     else {
                         Button("发送好友申请") { Task { await fed.run {
                             struct Result: Decodable { let status: String }
@@ -593,6 +603,7 @@ struct FederationPostCard: View {
     @State private var showComment = false
     @State private var commentMenu: FederationObject?
     @State private var confirmDeletePost = false
+    @State private var viewingImage: FederationViewedImage?
     @FocusState private var commentFocused: Bool
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -608,6 +619,9 @@ struct FederationPostCard: View {
                         ForEach(Array(post.content.media.enumerated()), id: \.offset) { _, image in
                             GeometryReader { geometry in
                                 FederationImage(dataURL: image).frame(width: geometry.size.width, height: geometry.size.height).clipped()
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { viewingImage = FederationViewedImage(dataURL: image) }
+                                    .accessibilityAddTraits(.isButton).accessibilityLabel("查看大图")
                             }.aspectRatio(post.content.media.count == 1 ? 1.4 : 1, contentMode: .fit)
                         }
                     }
@@ -703,6 +717,7 @@ struct FederationPostCard: View {
             }
         }.padding(.vertical, 20).overlay(alignment: .bottom) { Color(hex: "EEEEEE").frame(height: 1) }
             .task { await cachedThread() }
+            .fullScreenCover(item: $viewingImage) { item in FederationImageViewer(dataURL: item.dataURL) }
             // Long-press menu for one comment. (A List hoists .contextMenu to the whole row, which
             // here is the whole feed, so the menu is driven by our own long-press instead.)
             // One presentation for the whole card: SwiftUI honours only one dialog per view, so
@@ -1263,5 +1278,108 @@ struct FederationGroupEditor: View {
         guard let group, !working else { return }; working = true; defer { working = false }
         do { try await fed.deleteGroup(group); dismiss() }
         catch { lock.handle(error); self.error = error.localizedDescription }
+    }
+}
+
+struct FederationViewedImage: Identifiable { let id = UUID(); let dataURL: String }
+
+/// Full-screen picture: pinch to zoom, double-tap to reset, tap or swipe down to close.
+struct FederationImageViewer: View {
+    let dataURL: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var scale: CGFloat = 1
+    @State private var settled: CGFloat = 1
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let image = FederationImage(dataURL: dataURL).image {
+                Image(uiImage: image).resizable().scaledToFit()
+                    .scaleEffect(scale)
+                    .gesture(MagnifyGesture()
+                        .onChanged { scale = max(1, min(4, settled * $0.magnification)) }
+                        .onEnded { _ in settled = scale })
+                    .onTapGesture(count: 2) { withAnimation { scale = 1; settled = 1 } }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { dismiss() }
+        .gesture(DragGesture().onEnded { if $0.translation.height > 80 && scale == 1 { dismiss() } })
+        .accessibilityAddTraits(.isButton).accessibilityLabel("关闭大图")
+    }
+}
+
+/// Likes and comments left under my posts and my AIs' posts, newest first.
+struct FederationNotificationsView: View {
+    let t: FCTheme
+    @EnvironmentObject var fed: FederationVM
+    @EnvironmentObject var lock: AppLock
+    @Environment(\.federationNavigate) private var navigate
+    @State private var opened: FederationNotification?
+    @State private var loading = false
+    @State private var error: String?
+    var body: some View {
+        List {
+            if fed.notifications.isEmpty && !loading {
+                Text(error == nil ? "还没有新的点赞或评论" : "").foregroundStyle(t.textM)
+            }
+            ForEach(fed.notifications) { item in
+                Button { opened = item } label: { row(item) }.buttonStyle(.borderless)
+            }
+            if fed.notificationCursor != nil {
+                Button("加载更多") { Task { await load(more: true) } }.disabled(loading)
+            }
+            if loading { ProgressView().frame(maxWidth: .infinity) }
+            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+        }
+        .listStyle(.plain).scrollContentBackground(.hidden).background(t.bg).tint(t.greenD)
+        .navigationTitle("社交通知").navigationBarTitleDisplayMode(.inline).toolbar(.visible, for: .navigationBar)
+        .task { await load(); await fed.markNotificationsSeen() }
+        .refreshable { await load(); await fed.markNotificationsSeen() }
+        .sheet(item: $opened) { item in
+            NavigationStack {
+                ScrollView { FederationPostCard(t: t, post: item.post).padding(.horizontal, 16) }
+                    .background(t.bg)
+                    .navigationTitle("动态").navigationBarTitleDisplayMode(.inline)
+                    .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { opened = nil } } }
+            }
+            .environmentObject(fed).environmentObject(lock)
+            .environment(\.federationNavigate, { actor in opened = nil; navigate(actor) })
+        }
+    }
+    private func row(_ item: FederationNotification) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            FederationImage(dataURL: fed.actors[item.actor]?.avatar,
+                            fallback: fed.actors[item.actor]?.kind == "ai" ? "sparkles" : "person.crop.square")
+                .frame(width: 42, height: 42).background(t.bg2).clipShape(RoundedRectangle(cornerRadius: 5))
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(fed.name(item.actor)).font(.system(size: 15, weight: .semibold)).foregroundStyle(t.textS)
+                    if item.unread { Circle().fill(Color.red).frame(width: 7, height: 7) }
+                }
+                if item.kind == "like" {
+                    Image(systemName: "heart").font(.system(size: 14)).foregroundStyle(t.textS)
+                } else {
+                    Text(item.text ?? "评论了你的朋友圈").font(.system(size: 14)).foregroundStyle(t.text).lineLimit(3)
+                }
+                if let time = item.time {
+                    Text(Date(timeIntervalSince1970: time), style: .relative).font(.system(size: 11)).foregroundStyle(t.textM)
+                }
+            }
+            Spacer(minLength: 8)
+            // Like WeChat: the post being reacted to, on the right.
+            if let first = item.post.content.media.first {
+                FederationImage(dataURL: first).frame(width: 56, height: 56).clipped()
+            } else {
+                Text(item.post.content.text).font(.system(size: 12)).foregroundStyle(t.textM)
+                    .lineLimit(3).frame(width: 64, alignment: .leading)
+                    .padding(6).background(t.bg2)
+            }
+        }
+        .padding(.vertical, 6).contentShape(Rectangle())
+    }
+    private func load(more: Bool = false) async {
+        guard !loading else { return }; loading = true; error = nil
+        defer { loading = false }
+        do { try await fed.loadNotifications(more: more) } catch { lock.handle(error); self.error = error.localizedDescription }
     }
 }
