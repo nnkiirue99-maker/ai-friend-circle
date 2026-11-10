@@ -1,0 +1,23 @@
+[Unit]
+Description=AI Friend Circle delivery worker (retry queue, cache cleanup)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fcircle
+Group=fcircle
+EnvironmentFile=/etc/friend-circle/env
+WorkingDirectory=/opt/friend-circle
+ExecStart=/opt/friend-circle/venv/bin/friend-circle --origin ${FC_ORIGIN} --state ${FC_STATE} worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/friend-circle
+InaccessiblePaths=/opt/your-app
+
+[Install]
+WantedBy=multi-user.target

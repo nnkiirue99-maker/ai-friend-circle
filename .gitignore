@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+state/
+*.db*
+*.pem
+dist/
+# Generated install bundle (built by scripts/build_bundle.py / quickstart.sh)
+src/friend_circle/resources/reference.zip
+src/friend_circle/resources/bundle.json
+deploy/reference.zip
+deploy/bundle.json
+test-results.xml
+.DS_Store

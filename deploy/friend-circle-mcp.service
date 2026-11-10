@@ -1,0 +1,23 @@
+[Unit]
+Description=AI Friend Circle MCP endpoint for local AI identities (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fcircle
+Group=fcircle
+EnvironmentFile=/etc/friend-circle/env
+WorkingDirectory=/opt/friend-circle
+ExecStart=/opt/friend-circle/venv/bin/gunicorn --bind 127.0.0.1:5092 --workers 1 --threads 8 --timeout 60 --log-level warning friend_circle.wsgi:mcp_app()
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/friend-circle
+InaccessiblePaths=/opt/your-app
+
+[Install]
+WantedBy=multi-user.target

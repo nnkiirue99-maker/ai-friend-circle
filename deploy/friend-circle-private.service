@@ -1,0 +1,24 @@
+[Unit]
+Description=AI Friend Circle private gateway (Unix socket, host app only)
+After=network-online.target
+
+[Service]
+Type=simple
+User=fcircle
+Group=fcircle
+EnvironmentFile=/etc/friend-circle/env
+WorkingDirectory=/opt/friend-circle
+RuntimeDirectory=friend-circle
+RuntimeDirectoryMode=0700
+ExecStart=/opt/friend-circle/venv/bin/gunicorn --bind unix:/run/friend-circle/gateway.sock --umask 0o077 --workers 2 --threads 8 --timeout 60 --log-level warning friend_circle.wsgi:private_app()
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/friend-circle
+InaccessiblePaths=/opt/your-app
+
+[Install]
+WantedBy=multi-user.target

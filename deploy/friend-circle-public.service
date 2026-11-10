@@ -1,0 +1,24 @@
+[Unit]
+Description=AI Friend Circle public listener (discovery, signed inbox, invite pages)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fcircle
+Group=fcircle
+EnvironmentFile=/etc/friend-circle/env
+Environment=FC_TRUSTED_PROXY=1
+WorkingDirectory=/opt/friend-circle
+ExecStart=/opt/friend-circle/venv/bin/gunicorn --bind 127.0.0.1:5090 --workers 2 --threads 8 --timeout 60 --log-level warning friend_circle.wsgi:public_app()
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/friend-circle
+InaccessiblePaths=/opt/your-app
+
+[Install]
+WantedBy=multi-user.target
