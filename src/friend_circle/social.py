@@ -18,6 +18,7 @@ from .store import encode, decode
 
 CAPABILITY = "private-profiles/1"
 SOCIAL_TYPES = {"Create", "Update", "Delete", "Like", "Undo"}
+THREAD_RESYNC_SECONDS = 120
 
 
 def actor_of(identifier):
@@ -181,6 +182,30 @@ class Social:
             expiry = min(expiry, published + policy[0] * 86400)
         return expiry
 
+    def _open_to_new_friends(self, object_id, reader, author):
+        """WeChat rule: a post shared with "all friends" is also visible to friends added
+        later (still within the account's visible-days window). Selected-friend and group posts,
+        and readers the author excluded, stay as they were. A friend who was removed and added
+        again does not get history back (removal revokes; re-adding never restores it)."""
+        human = self.controller(author) or author
+        if self.store.one(
+            "SELECT 1 FROM friendship_groups WHERE local_human=? AND status='cancelled' "
+            "AND (remote_human=? OR remote_ai LIKE ?)",
+            (human, reader, '%"' + reader + '"%'),
+        ):
+            return False
+        scope = self.store.one("SELECT body FROM post_scopes WHERE object_id=?", (object_id,))
+        if scope is None:
+            # Posts from before scopes were recorded: only one that reached nobody (it was
+            # shared with "all friends" while there were none yet) is treated as "all".
+            return not self.store.one(
+                "SELECT 1 FROM object_audience WHERE object_id=?", (object_id,)
+            )
+        audience = decode(scope[0]).get("audience", {"mode": "all"})
+        if not isinstance(audience, dict) or audience.get("mode", "all") != "all":
+            return False
+        return reader not in (audience.get("exclude") or [])
+
     def _allowed(self, row, reader):
         if row["deleted"]:
             return False
@@ -192,6 +217,9 @@ class Social:
             allowed = row["visibility"] != "self"
         elif not self.store.one(
             "SELECT 1 FROM object_audience WHERE object_id=? AND reader=?", (row["id"], reader)
+        ) and not (
+            row["visibility"] == "federated_friends"
+            and self._open_to_new_friends(row["id"], reader, row["actor"])
         ):
             return False
         elif row["visibility"] == "local":
@@ -297,18 +325,30 @@ class Social:
         minimum = (
             0 if owner_view or not policy or policy[0] is None else time.time() - policy[0] * 86400
         )
-        rows = self.store.all(
-            "SELECT o.rowid AS seq,o.id FROM social_objects o WHERE o.actor=? AND o.kind='post' AND o.deleted=0 AND o.rowid<? AND o.published>? AND (? OR (? AND o.visibility<>'self') OR EXISTS(SELECT 1 FROM object_audience a WHERE a.object_id=o.id AND a.reader=?)) ORDER BY o.rowid DESC LIMIT ?",
+        friend = reader != actor and self.s.relationships.is_friend(actor, reader)
+        candidates = self.store.all(
+            "SELECT o.rowid AS seq,o.id,EXISTS(SELECT 1 FROM object_audience a WHERE a.object_id=o.id AND a.reader=?) AS listed FROM social_objects o WHERE o.actor=? AND o.kind='post' AND o.deleted=0 AND o.rowid<? AND o.published>? AND (? OR (? AND o.visibility<>'self') OR EXISTS(SELECT 1 FROM object_audience a WHERE a.object_id=o.id AND a.reader=?) OR (? AND o.visibility='federated_friends')) ORDER BY o.rowid DESC LIMIT ?",
             (
+                reader,
                 actor,
                 before,
                 minimum,
                 int(owner_view),
                 self.controller(reader) == actor,
                 reader,
-                limit + 1,
+                int(friend),
+                (limit + 1) * 4,
             ),
         )
+        # Posts this reader reaches only through the "all friends" rule are checked one by one.
+        rows = [
+            r
+            for r in candidates
+            if owner_view
+            or self.controller(reader) == actor
+            or r["listed"]
+            or self._open_to_new_friends(r["id"], reader, actor)
+        ][: limit + 1]
         profile = self._profile(actor)
         # Links remain opt-in, and must independently be visible to this reader.
         profile["links"] = [
@@ -817,6 +857,17 @@ class Social:
             )
             if not self.s.relationships.is_friend(reader, owner) or not post:
                 raise FederationError("thread_forbidden", 403)
+        if not refresh and before is None and self._thread_resync_due(reader, root):
+            # Friends' likes and comments are cached with a short lease; reading only the cache
+            # made them vanish a few minutes later. Re-sync here, at most every couple of minutes;
+            # if a peer is offline, fall back to whatever is still cached.
+            try:
+                return self.thread(reader, root, refresh=True, limit=limit)
+            except FederationError as exc:
+                if exc.status < 500:
+                    raise
+            except OSError:
+                pass
         next_cursor = None
         fetched_items = []
         if refresh:
@@ -1004,10 +1055,27 @@ class Social:
             )
             self._notify_root(db, obj["root"])
 
+    def _thread_resync_due(self, reader, root):
+        key = "thread-sync:" + reader + " " + root
+        now = time.time()
+        with self.store.connect(write=True) as db:
+            last = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if last and now - float(last[0]) < THREAD_RESYNC_SECONDS:
+                return False
+            db.execute(
+                "INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(now)),
+            )
+        return True
+
     def cleanup(self):
         """Remove expired private caches; retain source originals and permanent delete tombstones."""
         now = time.time()
         with self.store.connect(write=True) as db:
+            db.execute(
+                "DELETE FROM metadata WHERE key LIKE 'thread-sync:%' AND CAST(value AS REAL)<?",
+                (now - 86400,),
+            )
             objects = db.execute("DELETE FROM object_cache WHERE expires<=?", (now,)).rowcount
             profiles = db.execute("DELETE FROM profile_cache WHERE expires<=?", (now,)).rowcount
         return {"expired_objects_removed": objects, "expired_profiles_removed": profiles}

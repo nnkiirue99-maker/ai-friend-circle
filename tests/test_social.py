@@ -45,12 +45,9 @@ def test_selected_audience_signed_read_and_history_not_default_public(nodes):
     connect(a, c)
     drain(a, b, c)
     c.social.refresh(c.person, a.person)
-    assert c.social.profile(c.person, a.person)["items"] == []
-    with pytest.raises(FederationError):
-        a.social.object(c.person, old["id"])
-    a.social.history_grant(a.person, a.person, c.person, [old["id"]])
-    drain(a, b, c)
+    # WeChat rule: an "all friends" post is visible to a friend added later as well.
     assert c.social.profile(c.person, a.person)["items"][0]["id"] == old["id"]
+    assert a.social.object(c.person, old["id"])["id"] == old["id"]
     private = post(
         a,
         "only B",
@@ -521,3 +518,53 @@ def test_deleting_own_and_own_ai_posts_reaches_friends(nodes):
     theirs = post(b, "b 的动态")
     with pytest.raises(FederationError):
         b.social.delete(b.ai, theirs["id"])
+
+
+def test_new_friends_see_earlier_all_friends_posts_but_not_selected_or_group(nodes):
+    a, b, c, _ = nodes
+    connect(a, b)
+    shared = post(a, "给所有好友")
+    only_b = post(
+        a,
+        "只给 B",
+        scope={
+            "visibility": "federated_friends",
+            "audience": {"mode": "selected", "include": [b.person]},
+        },
+    )
+    ai_post = post(a, "AI 在还没有好友时发的", a.ai)
+    connect(a, c)
+    drain(a, b, c)
+    c.social.refresh(c.person, a.person)
+    c.social.refresh(c.person, a.ai)
+    seen = str(c.social.profile(c.person, a.person)) + str(c.social.profile(c.person, a.ai))
+    assert shared["id"] in seen and ai_post["id"] in seen  # the reported case: an AI's early post
+    assert only_b["id"] not in seen
+    # The account's visible-days window still applies to new friends.
+    with a.store.connect(write=True) as db:
+        db.execute(
+            "UPDATE social_objects SET published=published-10*86400 WHERE id=?", (shared["id"],)
+        )
+    a.visibility.set(a.person, a.person, 3, 0)
+    with pytest.raises(FederationError):
+        a.social.object(c.person, shared["id"])
+
+
+def test_friends_likes_and_comments_do_not_vanish_after_the_cache_lease(nodes):
+    a, b, _, _ = nodes
+    connect(a, b)
+    mine = post(a, "我的动态")
+    drain(a, b)
+    b.social.refresh(b.person, a.person)
+    like = b.social.interact(b.person, b.person, mine["id"], "like")
+    comment = b.social.interact(b.person, b.person, mine["id"], "comment", "好看")
+    drain(a, b)
+    # Leases ran out and nobody pressed "refresh": the plain thread read must still show them.
+    with a.store.connect(write=True) as db:
+        db.execute("UPDATE object_cache SET expires=0")
+        db.execute("DELETE FROM metadata WHERE key LIKE 'thread-sync:%'")
+    seen = {x["id"] for x in a.social.thread(a.person, mine["id"])["items"]}
+    assert {like["id"], comment["id"]} <= seen
+    # The same holds for the AI the author controls, and for a friend reading the thread.
+    b_seen = {x["id"] for x in b.social.thread(b.person, mine["id"])["items"]}
+    assert {like["id"], comment["id"]} <= b_seen
