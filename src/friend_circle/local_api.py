@@ -203,6 +203,13 @@ def make_blueprint(service, principal, ui_origin):
             )
         ), 201
 
+    @bp.get("/social/posts/scope")
+    def post_scope():
+        identifier = request.args.get("id", "")
+        if not identifier or len(identifier) > 2048:
+            raise FederationError("invalid_request")
+        return jsonify(service.social.post_scope(principal(), identifier))
+
     @bp.put("/social/posts")
     def post_update():
         obj = data()

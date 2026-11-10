@@ -14,7 +14,16 @@ enum FederationAppearance {
 private struct FederationNavigateKey: EnvironmentKey {
     static let defaultValue: (String) -> Void = { _ in }
 }
+private struct FederationEditKey: EnvironmentKey {
+    static let defaultValue: (FederationObject) -> Void = { _ in }
+}
 extension EnvironmentValues {
+    /// Opens the editor for one of my posts. Presented by the hub (sheets inside List rows
+    /// do not present reliably), so any card on any page can ask for it.
+    var federationEdit: (FederationObject) -> Void {
+        get { self[FederationEditKey.self] }
+        set { self[FederationEditKey.self] = newValue }
+    }
     var federationNavigate: (String) -> Void {
         get { self[FederationNavigateKey.self] }
         set { self[FederationNavigateKey.self] = newValue }
@@ -95,6 +104,7 @@ struct FederationHubView: View {
     @Environment(\.dismiss) var dismiss
     @Environment(\.scenePhase) var scenePhase
     @State private var keyboardUp = false
+    @State private var editingPost: FederationObject?
     @State private var showInvite = false
     @State private var section = "feed"
     @State private var showCompose = false
@@ -234,6 +244,10 @@ struct FederationHubView: View {
             }
             .onChange(of: scenePhase) { _, phase in if phase == .active { Task { await fed.refreshContacts() } } }
         }.environment(\.federationNavigate, { id in path.append(FederationActorRoute(id: id)) })
+        .environment(\.federationEdit, { post in editingPost = post })
+        .sheet(item: $editingPost) { post in
+            FederationComposeSheet(t: t, editing: post).environmentObject(fed).environmentObject(lock)
+        }
     }
     private func tab(_ value: String, _ title: String, _ symbol: String, badge: Int = 0) -> some View {
         Button { section = value } label: {
@@ -599,11 +613,13 @@ struct FederationPostCard: View {
     @State private var reply: FederationObject?
     @State private var error: String?
     @State private var sending = false
-    @State private var showActions = false
     @State private var showComment = false
     @State private var commentMenu: FederationObject?
     @State private var confirmDeletePost = false
     @State private var viewingImage: FederationViewedImage?
+    @Environment(\.federationEdit) private var edit
+    /// The latest version of this post: an edit made here shows at once.
+    private var shown: FederationObject { fed.editedPosts[post.id] ?? post }
     @FocusState private var commentFocused: Bool
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -613,53 +629,44 @@ struct FederationPostCard: View {
             }.buttonStyle(.borderless).frame(width: 42, alignment: .leading).accessibilityLabel("查看\(fed.name(post.actor))的主页")
             VStack(alignment: .leading, spacing: 10) {
                 nameLink(post.actor)
-                Text(post.content.text).font(.system(size: 15)).lineSpacing(4).foregroundStyle(t.text).textSelection(.enabled)
-                if !post.content.media.isEmpty {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: min(3, post.content.media.count)), spacing: 4) {
-                        ForEach(Array(post.content.media.enumerated()), id: \.offset) { _, image in
+                Text(shown.content.text).font(.system(size: 15)).lineSpacing(4).foregroundStyle(t.text).textSelection(.enabled)
+                if !shown.content.media.isEmpty {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: min(3, shown.content.media.count)), spacing: 4) {
+                        ForEach(Array(shown.content.media.enumerated()), id: \.offset) { _, image in
                             GeometryReader { geometry in
                                 FederationImage(dataURL: image).frame(width: geometry.size.width, height: geometry.size.height).clipped()
                                     .contentShape(Rectangle())
                                     .onTapGesture { viewingImage = FederationViewedImage(dataURL: image) }
                                     .accessibilityAddTraits(.isButton).accessibilityLabel("查看大图")
-                            }.aspectRatio(post.content.media.count == 1 ? 1.4 : 1, contentMode: .fit)
+                            }.aspectRatio(shown.content.media.count == 1 ? 1.4 : 1, contentMode: .fit)
                         }
                     }
                 }
                 HStack {
                     Text(Date(timeIntervalSince1970: post.published), style: .relative).font(.system(size: 11)).foregroundStyle(t.textM)
                     Spacer()
-                    Button { showActions.toggle() } label: {
-                        Image(systemName: "ellipsis").font(.system(size: 15, weight: .bold)).foregroundStyle(t.textS)
-                            .padding(.horizontal, 7).padding(.vertical, 3).background(t.bg2, in: RoundedRectangle(cornerRadius: 3))
-                    }.buttonStyle(.borderless).accessibilityLabel("点赞或评论")
-                }
-                if showActions {
-                    HStack {
-                        Button {
-                            Task { await action {
-                                if let ownLike = thread?.items.first(where: { $0.kind == "like" && $0.actor == acting && $0.lease_until > Date().timeIntervalSince1970 }) {
-                                    let _: FederationOK = try await FCAPI.shared.federation("/social/delete", body: ["id": ownLike.id])
-                                } else {
-                                    struct Result: Decodable { let id: String }
-                                    let _: Result = try await FCAPI.shared.federation("/social/interact", body: ["root": post.id, "kind": "like"])
-                                }
-                            } }
-                        } label: { Label(thread?.items.contains(where: { $0.kind == "like" && $0.actor == acting }) == true ? "取消赞" : "赞", systemImage: "heart") }
-                        Spacer()
-                        Button { reply = nil; showComment = true; showActions = false; commentFocused = true } label: { Label("评论", systemImage: "bubble") }
-                        Spacer()
-                        Button("刷新") { Task { await refreshThread() } }
+                    // A system menu, not a hand-made bar: it is drawn above the list, so taps
+                    // land reliably even while the feed re-renders every second.
+                    Menu {
+                        Button { Task { await toggleLike() } } label: {
+                            Label(iLiked ? "取消赞" : "赞", systemImage: iLiked ? "heart.slash" : "heart")
+                        }
+                        Button { reply = nil; showComment = true; commentFocused = true } label: { Label("评论", systemImage: "bubble") }
+                        if fed.isMe(post.actor) {
+                            // Only the author edits; a human may delete, never rewrite, its AI's post.
+                            Button { edit(shown) } label: { Label("编辑", systemImage: "pencil") }
+                        }
                         if fed.isMe(post.actor) || fed.isOwnAI(post.actor) {
-                            Spacer()
-                            Button {
-                                // The dialog is a popover anchored to this card: wait until the finger is
-                                // lifted, or that same touch-up counts as "tap outside" and closes it.
+                            Button(role: .destructive) {
+                                // Let the menu finish closing before the confirmation appears.
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { confirmDeletePost = true }
                             } label: { Label("删除", systemImage: "trash") }
                         }
-                    }.buttonStyle(.borderless).font(.system(size: 12)).foregroundStyle(.white).padding(12)
-                        .background(Color(hex: "4C4C4C"), in: RoundedRectangle(cornerRadius: 4)).disabled(sending)
+                    } label: {
+                        Image(systemName: "ellipsis").font(.system(size: 15, weight: .bold)).foregroundStyle(t.textS)
+                            .padding(.horizontal, 7).padding(.vertical, 3).background(t.bg2, in: RoundedRectangle(cornerRadius: 3))
+                    }
+                    .disabled(sending).accessibilityLabel("点赞、评论或更多操作")
                 }
                 // WeChat-style interactions: likes first, then one line per comment, "A回复B: text".
                 TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -740,18 +747,30 @@ struct FederationPostCard: View {
                             defer { sending = false }
                             do {
                                 let _: FederationOK = try await FCAPI.shared.federation("/social/delete", body: ["id": post.id])
-                                showActions = false
                                 fed.deletedPosts.insert(post.id)
                             } catch { lock.handle(error); self.error = error.localizedDescription }
                         }
                     }
                 }
-                Button("取消", role: .cancel) { showActions = false }
+                Button("取消", role: .cancel) {}
             } message: {
                 if commentMenu == nil && confirmDeletePost { Text("好友那边也会一起删除，下面的点赞和评论随之消失。") }
             }
     }
     // Names inside the grey box are links (open that person's or AI's page); the rest is plain text.
+    private var iLiked: Bool {
+        thread?.items.contains(where: { $0.kind == "like" && $0.actor == acting && $0.lease_until > Date().timeIntervalSince1970 }) == true
+    }
+    private func toggleLike() async {
+        await action {
+            if let ownLike = thread?.items.first(where: { $0.kind == "like" && $0.actor == acting && $0.lease_until > Date().timeIntervalSince1970 }) {
+                let _: FederationOK = try await FCAPI.shared.federation("/social/delete", body: ["id": ownLike.id])
+            } else {
+                struct Result: Decodable { let id: String }
+                let _: Result = try await FCAPI.shared.federation("/social/interact", body: ["root": post.id, "kind": "like"])
+            }
+        }
+    }
     private static func link(for actor: String) -> URL? {
         URL(string: "fc-actor:" + (actor.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""))
     }
@@ -888,6 +907,8 @@ struct FederationPendingFeatureView: View {
 
 struct FederationComposeView: View {
     let t: FCTheme
+    /// When set, this screen edits that post (keeping its audience unless changed here).
+    var editing: FederationObject? = nil
     @EnvironmentObject var fed: FederationVM
     @Environment(\.dismiss) var dismiss
     @State private var text = ""
@@ -901,6 +922,7 @@ struct FederationComposeView: View {
     @State private var media: [String] = []
     @State private var preparingImages = false
     @State private var showPreview = false
+    @State private var editLoaded = false
     private var members: [String] { Array(Set(fed.contacts.filter { $0.status == "active" }.flatMap { [$0.remote_human] + $0.remote_ai })).sorted() }
     private var recipients: [String] {
         if audience == "self" { return [] }
@@ -908,7 +930,7 @@ struct FederationComposeView: View {
         return members.filter { audience == "selected" ? selected.contains($0) : audience == "excluded" ? !excluded.contains($0) : true }
     }
     private var canPublish: Bool {
-        fed.me.map(fed.isMe) == true && !fed.busy && !preparingImages &&
+        fed.me.map(fed.isMe) == true && !fed.busy && !preparingImages && (editing == nil || editLoaded) &&
         (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !media.isEmpty) &&
         (audience != "selected" || !recipients.isEmpty) &&
         (audience != "group" || (groupsReady && !selectedGroups.isEmpty && !recipients.isEmpty))
@@ -979,10 +1001,10 @@ struct FederationComposeView: View {
             }
             if let error = fed.error { Text(error).font(.caption).foregroundStyle(.red) }
         }.scrollContentBackground(.hidden).background(t.bg).tint(t.greenD)
-            .navigationTitle("发表文字").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(editing == nil ? "发表文字" : "编辑动态").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("发表") { Task { await publish() } }.fontWeight(.semibold).disabled(!canPublish)
+                    Button(editing == nil ? "发表" : "保存") { Task { await publish() } }.fontWeight(.semibold).disabled(!canPublish)
                 }
             }
             .onChange(of: imageItems) { _, items in Task {
@@ -998,8 +1020,9 @@ struct FederationComposeView: View {
             .task {
                 do { try await fed.loadGroups(); groupsReady = true }
                 catch { fed.error = error.localizedDescription }
+                if let editing, !editLoaded { await loadForEditing(editing) }
             }
-            .alert("已发布", isPresented: $published) { Button("完成") { dismiss() } }
+            .alert(editing == nil ? "已发布" : "已保存", isPresented: $published) { Button("完成") { dismiss() } }
     }
     private func audienceRow(_ title: String, detail: String, value: String) -> some View {
         Button { audience = value } label: {
@@ -1010,17 +1033,50 @@ struct FederationComposeView: View {
             }
         }.buttonStyle(.plain)
     }
+    /// Fill the form with the post as it is now, including exactly who it was shared with.
+    private func loadForEditing(_ post: FederationObject) async {
+        struct Scope: Decodable {
+            struct Audience: Decodable { let mode: String?; let include: [String]?; let exclude: [String]?; let groups: [String]? }
+            let visibility: String
+            let audience: Audience?
+        }
+        text = post.content.text; media = post.content.media
+        var query = URLComponents(); query.queryItems = [URLQueryItem(name: "id", value: post.id)]
+        do {
+            let scope: Scope = try await FCAPI.shared.federation("/social/posts/scope?" + (query.percentEncodedQuery ?? ""))
+            let mode = scope.audience?.mode ?? "all"
+            if scope.visibility == "self" { audience = "self" }
+            else if mode == "group" { audience = "group"; selectedGroups = Set(scope.audience?.groups ?? []) }
+            else if mode == "selected" { audience = "selected"; selected = Set(scope.audience?.include ?? []) }
+            else if !(scope.audience?.exclude ?? []).isEmpty { audience = "excluded"; excluded = Set(scope.audience?.exclude ?? []) }
+            else { audience = "all" }
+            editLoaded = true
+        } catch { fed.error = error.localizedDescription }
+    }
     private func publish() async {
         guard canPublish, let me = fed.me, fed.isMe(me) else { return }
+        if let editing {
+            await fed.run {
+                let scope = currentScope()
+                let saved: FederationObject = try await FCAPI.shared.federation("/social/posts", body: [
+                    "id": editing.id, "text": text, "media": media, "scope": scope, "expected_revision": editing.revision,
+                ], method: "PUT")
+                fed.editedPosts[saved.id] = saved
+                published = true
+            }
+            return
+        }
         await fed.run {
-            let scope: [String: Any] = ["visibility": audience == "self" ? "self" : "federated_friends",
-                "audience": audience == "group" ? ["mode": "group", "groups": Array(selectedGroups)] :
-                    ["mode": audience == "selected" ? "selected" : "all",
-                     "include": audience == "selected" ? Array(selected) : [],
-                     "exclude": audience == "excluded" ? Array(excluded) : []]]
-            let _: FederationObject = try await FCAPI.shared.federation("/social/posts", body: ["text": text, "media": media, "scope": scope])
+            let _: FederationObject = try await FCAPI.shared.federation("/social/posts", body: ["text": text, "media": media, "scope": currentScope()])
             published = true
         }
+    }
+    private func currentScope() -> [String: Any] {
+        ["visibility": audience == "self" ? "self" : "federated_friends",
+         "audience": audience == "group" ? ["mode": "group", "groups": Array(selectedGroups)] :
+            ["mode": audience == "selected" ? "selected" : "all",
+             "include": audience == "selected" ? Array(selected) : [],
+             "exclude": audience == "excluded" ? Array(excluded) : []]]
     }
 }
 
@@ -1121,13 +1177,14 @@ struct FederationFeedRows: View {
 
 struct FederationComposeSheet: View {
     let t: FCTheme
+    var editing: FederationObject? = nil
     @EnvironmentObject var fed: FederationVM
     @EnvironmentObject var lock: AppLock
     @Environment(\.dismiss) var dismiss
     var body: some View {
         NavigationStack {
             Group {
-                if fed.ready { FederationComposeView(t: t) }
+                if fed.ready { FederationComposeView(t: t, editing: editing) }
                 else { VStack(spacing: 16) { ProgressView(); Text(fed.error ?? "正在连接你的服务器…").font(.caption) }.padding().background(t.bg) }
             }
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } } }

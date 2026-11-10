@@ -119,8 +119,10 @@ struct FederationAPIError: LocalizedError {
     @Published var contactCursor: Int?
     /// Posts deleted in this session; every list hides them at once without a reload.
     @Published var deletedPosts = Set<String>()
+    /// Posts edited in this session, shown with their new text/photos without a reload.
+    @Published var editedPosts: [String: FederationObject] = [:]
     // Never cache private posts to UserDefaults or disk. The server owns authorized caches.
-    func reset() { me = nil; ownActors = []; contacts = []; friendGroups = []; groupCandidates = []; actors = [:]; notes = [:]; notifications = []; unreadNotifications = 0; notificationCursor = nil; ready = false }
+    func reset() { me = nil; ownActors = []; contacts = []; friendGroups = []; groupCandidates = []; actors = [:]; notes = [:]; notifications = []; unreadNotifications = 0; notificationCursor = nil; editedPosts = [:]; deletedPosts = []; ready = false }
     func name(_ actor: String) -> String {
         if let note = notes[actor], !note.isEmpty { return note }
         if let profile = actors[actor], profile.lease_until.map({ $0 > Date().timeIntervalSince1970 }) ?? true { return profile.name }

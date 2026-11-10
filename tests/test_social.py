@@ -598,3 +598,38 @@ def test_notifications_cover_own_and_own_ai_posts_with_text_time_and_unread(node
     assert "再来一条" not in str(a.social.notifications(a.person))
     with pytest.raises(FederationError):
         a.social.notifications(a.ai)  # notifications belong to the human account
+
+
+def test_author_reads_original_scope_to_edit_without_changing_audience(nodes):
+    a, b, c, _ = nodes
+    connect(a, b)
+    connect(a, c)
+    only_b = post(
+        a,
+        "只给 B",
+        scope={
+            "visibility": "federated_friends",
+            "audience": {"mode": "selected", "include": [b.person]},
+        },
+    )
+    drain(a, b, c)
+    scope = a.social.post_scope(a.person, only_b["id"])
+    assert scope["audience"]["mode"] == "selected" and scope["audience"]["include"] == [b.person]
+    edited = a.social.update(a.person, only_b["id"], "改过的文字", scope, only_b["revision"])
+    drain(a, b, c)
+    assert (
+        edited["content"]["text"] == "改过的文字" and edited["revision"] == only_b["revision"] + 1
+    )
+    b.social.refresh(b.person, a.person)
+    c.social.refresh(c.person, a.person)
+    assert "改过的文字" in str(b.social.profile(b.person, a.person))
+    assert only_b["id"] not in str(c.social.profile(c.person, a.person))
+    # Only the author may read or change it; its human cannot edit an AI's post.
+    ai_post = post(a, "AI 的", a.ai)
+    for principal, target in ((b.person, only_b["id"]), (a.person, ai_post["id"])):
+        with pytest.raises(FederationError):
+            a.social.post_scope(principal, target)
+    with pytest.raises(FederationError):
+        a.social.update(
+            a.person, only_b["id"], "旧版本", scope, only_b["revision"]
+        )  # stale revision

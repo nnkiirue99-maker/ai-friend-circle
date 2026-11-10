@@ -472,6 +472,35 @@ class Social:
             self._notify(db, row["actor"], identifier, "post", set(previous) | recipients)
         return self.object(row["actor"], identifier)
 
+    def post_scope(self, principal, identifier):
+        """The audience a post was shared with, so its author can edit it without silently
+        widening or narrowing who sees it. Only the author itself may ask (same rule as edit)."""
+        row = self.store.one(
+            "SELECT * FROM social_objects WHERE id=? AND kind='post' AND deleted=0", (identifier,)
+        )
+        if not row:
+            raise FederationError("post_not_found", 404)
+        self.speak(principal, row["actor"])
+        stored = self.store.one("SELECT body FROM post_scopes WHERE object_id=?", (identifier,))
+        if stored:
+            return decode(stored[0])
+        # Posts from before scopes were recorded: rebuild it from who can read the post.
+        if row["visibility"] != "federated_friends":
+            return {"visibility": row["visibility"]}
+        readers = {
+            r[0]
+            for r in self.store.all(
+                "SELECT reader FROM object_audience WHERE object_id=?", (identifier,)
+            )
+        }
+        friends = set(self.friends(row["actor"]))
+        if not readers or friends <= readers:
+            return {"visibility": "federated_friends", "audience": {"mode": "all"}}
+        return {
+            "visibility": "federated_friends",
+            "audience": {"mode": "selected", "include": sorted(readers & friends)},
+        }
+
     def delete(self, principal, identifier):
         row = self.store.one("SELECT * FROM social_objects WHERE id=?", (identifier,))
         if not row:
