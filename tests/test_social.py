@@ -598,6 +598,10 @@ def test_notifications_cover_own_and_own_ai_posts_with_text_time_and_unread(node
     assert "再来一条" not in str(a.social.notifications(a.person))
     with pytest.raises(FederationError):
         a.social.notifications(a.ai)  # notifications belong to the human account
+    with a.store.connect(write=True) as db:  # older than 24 hours: dropped from the list
+        db.execute("UPDATE social_references SET received=received-86401")
+    result = a.social.notifications(a.person)
+    assert result["items"] == [] and result["unread"] == 0
 
 
 def test_author_reads_original_scope_to_edit_without_changing_audience(nodes):

@@ -18,6 +18,7 @@ from .store import encode, decode
 
 CAPABILITY = "private-profiles/1"
 SOCIAL_TYPES = {"Create", "Update", "Delete", "Like", "Undo"}
+NOTIFICATION_SECONDS = 86400  # social notifications list only the last 24 hours
 THREAD_RESYNC_SECONDS = 120
 
 
@@ -1085,28 +1086,30 @@ class Social:
             self._notify_root(db, obj["root"])
 
     def notifications(self, human, before=None, limit=20):
-        """Likes and comments others left under posts by this human or the AIs it controls,
-        newest first, with the comment text, the time and the post, plus the unread count."""
+        """Likes and comments others left under posts by this human or the AIs it controls
+        in the last 24 hours, newest first, with the comment text, the time and the post, plus the unread count."""
         self.s.relationships._human(human)
         cursor = page(before, limit)
         authors = self.own_authors(human)
         marks = ",".join("?" * len(authors))
         base = (
             "FROM social_references r JOIN social_objects o ON o.id=r.root "
-            f"WHERE o.actor IN ({marks}) AND o.deleted=0 AND r.actor NOT IN ({marks})"
+            f"WHERE o.actor IN ({marks}) AND o.deleted=0 AND r.actor NOT IN ({marks}) "
+            "AND r.received>=?"
         )
+        since = time.time() - NOTIFICATION_SECONDS
         rows = self.store.all(
             "SELECT r.rowid AS seq,r.id,r.actor,r.kind,r.root,r.received "
             + base
             + " AND r.rowid<? ORDER BY r.rowid DESC LIMIT ?",
-            (*authors, *authors, cursor, limit + 1),
+            (*authors, *authors, since, cursor, limit + 1),
         )
         seen = self.store.one(
             "SELECT value FROM metadata WHERE key=?", ("notifications-seen:" + human,)
         )
         seen = int(seen[0]) if seen else 0
         unread = self.store.one(
-            "SELECT count(*) " + base + " AND r.rowid>?", (*authors, *authors, seen)
+            "SELECT count(*) " + base + " AND r.rowid>?", (*authors, *authors, since, seen)
         )[0]
         items = []
         for row in rows[:limit]:
