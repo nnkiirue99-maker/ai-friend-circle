@@ -92,22 +92,45 @@ def plain(value, maximum=4000):
     return value
 
 
-LINK_TTL = 600  # seconds a picture link handed to an AI stays usable
+LINK_TTL = 600  # seconds a picture link handed to an AI is promised to stay usable
+LINK_BUCKET = 3600  # links are stable within an hour, so browsers and apps can cache them
 MAX_PICTURES = 4
+PREFIX = "/federation/media/"
 
 
-def readable_pictures(service, reader, identifier):
-    """(post, [(mime, base64)]) for a post the reader may see; access re-checked each call."""
-    obj = (
-        service.social.object(reader, identifier)
-        if service.social.local(identifier.split("/objects/")[0])
-        else service.social.fetch(reader, identifier)
+def _split(item):
+    head, _, data = item.partition(";base64,")
+    if head in {"data:image/jpeg", "data:image/png", "data:image/webp"} and data:
+        return head[5:], data
+    return None
+
+
+def _digest(data):
+    return hashlib.sha256(data.encode()).hexdigest()[:24]
+
+
+def _visible_object(service, reader, identifier, network):
+    """The post as `reader` may see it now: original for local, lease-bound cache for remote."""
+    social = service.social
+    if social.local(identifier.split("/objects/")[0]):
+        return social.object(reader, identifier)
+    row = service.store.one(
+        "SELECT actor,body FROM object_cache WHERE reader=? AND id=? AND expires>?",
+        (reader, identifier, time.time()),
     )
-    pictures = []
-    for item in obj["content"].get("media", [])[:MAX_PICTURES]:
-        head, _, data = item.partition(";base64,")
-        if head in {"data:image/jpeg", "data:image/png", "data:image/webp"} and data:
-            pictures.append((head[5:], data))
+    if row and service.relationships.is_friend(reader, row["actor"]):
+        from .store import decode
+
+        return decode(row["body"])
+    if not network:
+        raise FederationError("media_not_found", 404)
+    return social.fetch(reader, identifier)
+
+
+def readable_pictures(service, reader, identifier, network=True):
+    """(post, [(mime, base64)]) for a post the reader may see; access re-checked each call."""
+    obj = _visible_object(service, reader, identifier, network)
+    pictures = [p for p in map(_split, obj["content"].get("media", [])[:MAX_PICTURES]) if p]
     return obj, pictures
 
 
@@ -130,29 +153,146 @@ def _b64(raw):
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def media_link(service, reader, identifier, index, now=None):
-    expires = int((time.time() if now is None else now) + LINK_TTL)
-    payload = _b64(
-        json.dumps(
-            {"r": reader, "o": identifier, "i": index, "e": expires}, separators=(",", ":")
-        ).encode()
-    )
+def _sign(service, claims):
+    payload = _b64(json.dumps(claims, separators=(",", ":")).encode())
     sig = _b64(hmac.new(_link_key(service), payload.encode(), hashlib.sha256).digest())
-    return f"{service.config.origin}/federation/media/{payload}.{sig}.jpg", expires
+    return f"{service.config.origin}{PREFIX}{payload}.{sig}.jpg"
+
+
+def _expiry(now=None):
+    now = time.time() if now is None else now
+    return int((now + LINK_TTL) // LINK_BUCKET + 1) * LINK_BUCKET
+
+
+def media_link(service, reader, identifier, data, now=None):
+    """Signed link to one picture (its base64 `data`) of a post, as seen by `reader`.
+
+    Bound to the picture's content hash, so an edited post never serves a different image
+    under an old URL, and the same picture keeps the same URL for the current hour.
+    """
+    expires = _expiry(now)
+    claims = {"r": reader, "o": identifier, "h": _digest(data), "e": expires}
+    return _sign(service, claims), expires
+
+
+def profile_link(service, reader, actor, data, now=None):
+    """Signed link to an avatar or cover of `actor`, as `reader` currently sees that profile."""
+    expires = _expiry(now)
+    claims = {"r": reader, "o": actor, "h": _digest(data), "e": expires, "k": "p"}
+    return _sign(service, claims), expires
+
+
+def _visible_profile(service, reader, actor):
+    if service.social.local(actor):
+        return service.social._profile(actor)
+    row = service.store.one(
+        "SELECT body FROM profile_cache WHERE reader=? AND actor=? AND expires>?",
+        (reader, actor, time.time()),
+    )
+    if not row:
+        raise FederationError("media_not_found", 404)
+    from .store import decode
+
+    return decode(row[0])
+
+
+def _claims(service, token, now=None):
+    payload, sig = token.removesuffix(".jpg").split(".")
+    expected = _b64(hmac.new(_link_key(service), payload.encode(), hashlib.sha256).digest())
+    if not hmac.compare_digest(sig, expected):
+        raise ValueError
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    if claims["e"] < (time.time() if now is None else now):
+        raise ValueError
+    return claims
 
 
 def open_media_link(service, token, now=None):
-    """Bytes and mime type behind a signed link, or FederationError(404) for anything wrong."""
+    """(bytes, mime, expires) behind a signed link, or FederationError(404) for anything wrong."""
     try:
-        payload, sig = token.removesuffix(".jpg").split(".")
-        expected = _b64(hmac.new(_link_key(service), payload.encode(), hashlib.sha256).digest())
-        if not hmac.compare_digest(sig, expected):
-            raise ValueError
-        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        if claims["e"] < (time.time() if now is None else now):
-            raise ValueError
-        _, pictures = readable_pictures(service, claims["r"], claims["o"])
-        mime, data = pictures[claims["i"]]
-        return base64.b64decode(data, validate=True), mime
-    except (ValueError, KeyError, IndexError, TypeError, binascii.Error, FederationError) as exc:
+        claims = _claims(service, token, now)
+        if claims.get("k") == "p":
+            profile = _visible_profile(service, claims["r"], claims["o"])
+            pictures = [p for p in (_split(profile.get(f) or "") for f in ("avatar", "cover")) if p]
+        else:
+            _, pictures = readable_pictures(service, claims["r"], claims["o"], network=False)
+        for mime, data in pictures:
+            if _digest(data) == claims["h"]:
+                return base64.b64decode(data, validate=True), mime, claims["e"]
+        raise ValueError
+    except (ValueError, KeyError, TypeError, binascii.Error, FederationError) as exc:
         raise FederationError("media_not_found", 404) from exc
+
+
+def _links(service, reader, identifier, media):
+    out = []
+    for item in media:
+        part = _split(item) if isinstance(item, str) else None
+        out.append(media_link(service, reader, identifier, part[1])[0] if part else item)
+    return out
+
+
+def link_post_media(service, reader, obj):
+    """Copy of a post-shaped dict with inline pictures replaced by signed links.
+
+    Handles both shapes the local API returns: objects (content.media) and the web UI
+    snapshot's flattened posts (media).
+    """
+    if not isinstance(obj, dict) or not isinstance(obj.get("id"), str):
+        return obj
+    content = obj.get("content")
+    if isinstance(content, dict) and isinstance(content.get("media"), list):
+        media = _links(service, reader, obj["id"], content["media"])
+        return {**obj, "content": {**content, "media": media}}
+    if isinstance(obj.get("media"), list):
+        return {**obj, "media": _links(service, reader, obj["id"], obj["media"])}
+    return obj
+
+
+def link_profile_media(service, reader, obj):
+    """Copy of a profile-shaped dict with inline avatar/cover replaced by signed links."""
+    if not isinstance(obj, dict) or not ({"avatar", "cover"} & set(obj)):
+        return obj
+    actor = obj.get("actor_id") or obj.get("id")
+    if not isinstance(actor, str) or "/federation/actors/" not in actor:
+        return obj
+    out = dict(obj)
+    for field in ("avatar", "cover"):
+        part = _split(obj[field]) if isinstance(obj.get(field), str) else None
+        if part:
+            out[field] = profile_link(service, reader, actor, part[1])[0]
+    return out
+
+
+def linkify(service, reader, value):
+    """Walk an API response and swap post and profile pictures for links."""
+    if isinstance(value, list):
+        return [linkify(service, reader, x) for x in value]
+    if isinstance(value, dict):
+        value = link_profile_media(service, reader, link_post_media(service, reader, value))
+        return {k: linkify(service, reader, v) for k, v in value.items()}
+    return value
+
+
+def resolve_link(service, readers, identifier, item, kind=None):
+    """For edits: one link to a picture of this same post/profile, minted for `readers`,
+    back to an inline picture. Anything that is not one of our links is returned as is."""
+    base = service.config.origin + PREFIX
+    if not (isinstance(item, str) and item.startswith(base)):
+        return item
+    token = item[len(base) :]
+    try:
+        claims = _claims(service, token)
+        if claims["o"] != identifier or claims["r"] not in readers or claims.get("k") != kind:
+            raise ValueError
+        raw, mime, _ = open_media_link(service, token)
+    except (ValueError, KeyError, TypeError, FederationError) as exc:
+        raise FederationError("invalid_media") from exc
+    return f"data:{mime};base64," + base64.b64encode(raw).decode()
+
+
+def resolve_links(service, readers, identifier, media):
+    """For edits: turn picture links of this same post, minted for `readers`, back inline."""
+    if not isinstance(media, list):
+        return media
+    return [resolve_link(service, readers, identifier, item) for item in media]

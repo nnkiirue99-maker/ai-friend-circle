@@ -75,6 +75,8 @@ final class FCAPI {
               url.host == base.host, url.scheme == base.scheme else { throw FCAPIError.badData }
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         req.httpMethod = method ?? (body == nil ? "GET" : "POST")
+        // Post pictures as cacheable links instead of inline base64 (smaller pages).
+        req.setValue("links", forHTTPHeaderField: "X-Federation-Media")
         for (name, value) in headers { req.setValue(value, forHTTPHeaderField: name) }
         if let body {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")

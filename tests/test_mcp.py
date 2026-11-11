@@ -387,19 +387,19 @@ def test_ai_can_look_at_pictures_only_on_posts_it_may_see(nodes):
     path = link.removeprefix("https://b.test")
     got = web.get(path, headers={"Host": "b.test"})
     assert got.status_code == 200 and got.mimetype == "image/jpeg"
-    assert got.headers["Cache-Control"] == "no-store"
+    assert got.headers["Cache-Control"].startswith("private, max-age=")
     assert Image.open(BytesIO(got.data)).size == (64, 48)
     # Tampered, expired, or revoked links all look the same: not found.
     head, sig = path.rsplit(".", 2)[0], path.rsplit(".", 2)[1]
     assert web.get(head + "." + sig[::-1] + ".jpg", headers={"Host": "b.test"}).status_code == 404
     from friend_circle.media import media_link
 
-    expired, _ = media_link(b, b.ai, shared["id"], 0, now=time.time() - 3600)
+    expired, _ = media_link(b, b.ai, shared["id"], block["data"], now=time.time() - 7300)
     assert (
         web.get(expired.removeprefix("https://b.test"), headers={"Host": "b.test"}).status_code
         == 404
     )
-    forged, _ = media_link(b, b.ai, hidden["id"], 0)
+    forged, _ = media_link(b, b.ai, hidden["id"], block["data"])
     assert (
         web.get(forged.removeprefix("https://b.test"), headers={"Host": "b.test"}).status_code
         == 404

@@ -4,6 +4,7 @@ The host must supply its authenticated principal resolver. This adapter is NOT
 registered on the public federation app. Production wiring is a later step.
 """
 
+import json
 from pathlib import Path
 import re
 
@@ -12,6 +13,7 @@ from flask import Blueprint, Response, jsonify, request
 from . import projection
 from .config import origin_of
 from .errors import FederationError
+from .media import linkify, resolve_link, resolve_links
 
 
 UI_CSP = (
@@ -180,11 +182,23 @@ def make_blueprint(service, principal, ui_origin):
     @bp.put("/social/profile")
     def profile_set():
         obj = data()
+        actor = reader(obj)
+        profile = obj.get("profile")
+        if isinstance(profile, dict):
+            # Unchanged avatar/cover come back as the links we handed out.
+            profile = {
+                **profile,
+                **{
+                    f: resolve_link(service, {principal(), actor}, actor, profile[f], "p")
+                    for f in ("avatar", "cover")
+                    if f in profile
+                },
+            }
         return jsonify(
             service.social.set_profile(
                 principal(),
-                reader(obj),
-                obj.get("profile"),
+                actor,
+                profile,
                 obj.get("expected_revision"),
                 obj.get("lease_seconds", 300),
             )
@@ -220,7 +234,13 @@ def make_blueprint(service, principal, ui_origin):
                 obj.get("text", ""),
                 obj.get("scope", {}),
                 obj.get("expected_revision"),
-                obj.get("media"),
+                # Clients that received picture links send them back unchanged when editing.
+                resolve_links(
+                    service,
+                    {principal(), field(obj, "id").split("/objects/")[0]},
+                    obj["id"],
+                    obj.get("media"),
+                ),
             )
         )
 
@@ -425,8 +445,27 @@ def make_blueprint(service, principal, ui_origin):
         service.relationships.unblock(principal(), field(data(), "remote_actor_id"))
         return jsonify(ok=True)
 
+    def wants_links():
+        return request.headers.get("X-Federation-Media") == "links"
+
     @bp.after_request
     def private_headers(response):
+        # Opt-in: clients that send X-Federation-Media: links get post pictures as signed,
+        # cacheable URLs instead of inline base64, so a page of posts stays small. Older
+        # clients keep receiving inline pictures.
+        if response.status_code in {200, 201} and response.is_json and wants_links():
+            body = request.get_json(silent=True) if request.method != "GET" else None
+            source = body if isinstance(body, dict) else request.args
+            viewer = source.get("actor_id")
+            try:
+                if not isinstance(viewer, str):
+                    raise FederationError("invalid_actor_id")
+                service.social.authorize(principal(), viewer)
+            except FederationError:
+                viewer = principal()
+            linked = linkify(service, viewer, response.get_json())
+            response.set_data(json.dumps(linked, ensure_ascii=False))
+            response.vary.add("X-Federation-Media")
         response.headers["Cache-Control"] = "private, no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response

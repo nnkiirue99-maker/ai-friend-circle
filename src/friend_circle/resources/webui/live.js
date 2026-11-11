@@ -28,7 +28,8 @@
     const response = await fetch(API + path, {
       method: method || (body === undefined ? 'GET' : 'POST'),
       credentials: 'same-origin', redirect: 'error', cache: 'no-store',
-      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+      // Ask for post pictures as cacheable links instead of inline base64 (smaller pages).
+      headers: body === undefined ? { 'X-Federation-Media': 'links' } : { 'Content-Type': 'application/json', 'X-Federation-Media': 'links' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     let result = null;
@@ -57,7 +58,9 @@
     }
     throw new Error('图片太大，请换一张较小的图片');
   }
-  const pictures = (media) => Promise.all((media || []).map((m) => shrink(m, 800, 80000)));
+  // Links we were given for an existing post go back as-is; the server turns them inline.
+  const linked = (value) => typeof value === 'string' && value.startsWith(location.origin + '/federation/media/');
+  const pictures = (media) => Promise.all((media || []).map((m) => (linked(m) ? m : shrink(m, 800, 80000))));
   function scope(value) {
     const ids = [...new Set((value && value.ids) || [])];
     switch (value && value.mode) {
@@ -113,7 +116,7 @@
         actor_id: target,
         profile: {
           name: own ? name.trim() : current.name, bio: own ? (bio || '') : (current.bio || ''),
-          avatar: await shrink(avatar, 240, 40000), cover: await shrink(cover, 900, 80000), links: current.links || [],
+          avatar: linked(avatar) ? avatar : await shrink(avatar, 240, 40000), cover: linked(cover) ? cover : await shrink(cover, 900, 80000), links: current.links || [],
         },
         expected_revision: current.revision,
       }, 'PUT');

@@ -1,3 +1,4 @@
+import time
 from urllib.parse import urlsplit
 
 from flask import Flask, Response, jsonify, request
@@ -42,7 +43,8 @@ def create_app(service):
 
     @app.after_request
     def headers(response):
-        response.headers["Cache-Control"] = "no-store"
+        if not (request.path.startswith("/federation/media/") and response.status_code == 200):
+            response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -109,8 +111,14 @@ def create_app(service):
         service.store.rate_limit("media:" + str(request.remote_addr), 60)
         if len(token) > 4096:
             raise FederationError("media_not_found", 404)
-        raw, mime = open_media_link(service, token)
-        return Response(raw, mimetype=mime)
+        raw, mime, expires = open_media_link(service, token)
+        response = Response(raw, mimetype=mime)
+        # The URL is bound to this exact picture and reader, so it may be cached until it
+        # expires; private keeps shared caches out of it.
+        response.headers["Cache-Control"] = "private, max-age=%d, immutable" % max(
+            0, int(expires - time.time())
+        )
+        return response
 
     @app.get("/healthz")
     def health():

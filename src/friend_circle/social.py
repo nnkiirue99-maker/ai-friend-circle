@@ -5,6 +5,7 @@ requesting Actor's existing HTTP signature. Interactions are fetched from their
 actual author's origin, never attributed using another server's assertion.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import time
 import uuid
@@ -20,6 +21,8 @@ CAPABILITY = "private-profiles/1"
 SOCIAL_TYPES = {"Create", "Update", "Delete", "Like", "Undo"}
 NOTIFICATION_SECONDS = 86400  # social notifications list only the last 24 hours
 THREAD_RESYNC_SECONDS = 120
+FRESH_ENOUGH = 120  # cached posts with more lease than this are not re-fetched on refresh
+SYNC_PARALLEL = 6  # friend servers contacted at the same time during a refresh
 
 
 def actor_of(identifier):
@@ -788,9 +791,17 @@ class Social:
                 "INSERT INTO profile_cache VALUES (?,?,?,?,?,?) ON CONFLICT(reader,actor) DO UPDATE SET body=excluded.body,expires=excluded.expires,synced=excluded.synced,next_cursor=excluded.next_cursor",
                 (reader, actor, encode(clean), expiry, time.time(), next_cursor),
             )
+        now = time.time()
         for item in items:
             if not isinstance(item, dict) or actor_of(item.get("id")) != actor:
                 raise FederationError("invalid_history_author", 502)
+            # Edits and deletions are pushed to us; a copy whose lease is still comfortably
+            # valid is not fetched again. Near expiry it is, so the origin re-checks access.
+            if self.store.one(
+                "SELECT 1 FROM object_cache WHERE reader=? AND id=? AND expires>?",
+                (reader, item["id"], now + FRESH_ENOUGH),
+            ):
+                continue
             try:
                 self.fetch(reader, item["id"])
             except FederationError as exc:
@@ -1261,17 +1272,32 @@ class Social:
                 )
                 if reader or not row or row["expires"] - now < soon:
                     due.append((row["synced"] if row else 0, local, friend))
-        renewed = failed = skipped = 0
-        down = set()
+        # One worker per friend server, a few servers at a time: a slow or offline server
+        # only holds up its own friends. Within a server, requests stay sequential and the
+        # first 5xx/429 skips the rest of that server for this pass.
+        by_origin = {}
         for _, local, friend in sorted(due):
-            if time.monotonic() > deadline or origin_of(friend) in down:
-                skipped += 1
-                continue
-            try:
-                self.refresh(local, friend)
-                renewed += 1
-            except FederationError as exc:
-                failed += 1
-                if exc.status >= 500 or exc.status == 429:
-                    down.add(origin_of(friend))
+            by_origin.setdefault(origin_of(friend), []).append((local, friend))
+
+        def renew(pairs):
+            counts = [0, 0, 0]  # renewed, failed, skipped
+            for n, (local, friend) in enumerate(pairs):
+                if time.monotonic() > deadline:
+                    counts[2] += len(pairs) - n
+                    break
+                try:
+                    self.refresh(local, friend)
+                    counts[0] += 1
+                except FederationError as exc:
+                    counts[1] += 1
+                    if exc.status >= 500 or exc.status == 429:
+                        counts[2] += len(pairs) - n - 1
+                        break
+            return counts
+
+        renewed = failed = skipped = 0
+        if by_origin:
+            with ThreadPoolExecutor(max_workers=min(SYNC_PARALLEL, len(by_origin))) as pool:
+                for r, f, k in pool.map(renew, by_origin.values()):
+                    renewed, failed, skipped = renewed + r, failed + f, skipped + k
         return {"renewed": renewed, "failed": failed, "skipped": skipped}

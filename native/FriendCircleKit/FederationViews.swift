@@ -30,20 +30,62 @@ extension EnvironmentValues {
     }
 }
 
-struct FederationImage: View {
-    let dataURL: String?
-    var fallback = "person.crop.square"
-    var image: UIImage? {
-        guard let dataURL, dataURL.hasPrefix("data:image/jpeg;base64,"),
-              dataURL.count < 100_000, let part = dataURL.split(separator: ",", maxSplits: 1).last,
+/// Post pictures arrive as signed, cacheable links (`/federation/media/…`); avatars, covers
+/// and photos picked for a new post are still inline JPEG data URLs.
+final class FederationImageStore {
+    static let shared = FederationImageStore()
+    private let memory = NSCache<NSString, UIImage>()
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 128 << 20)
+        config.requestCachePolicy = .useProtocolCachePolicy
+        return URLSession(configuration: config)
+    }()
+
+    static func isLink(_ value: String) -> Bool {
+        guard let url = URL(string: value) else { return false }
+        return url.scheme == "https" && url.path.hasPrefix("/federation/media/") && value.count < 4096
+    }
+
+    static func decodeInline(_ value: String) -> UIImage? {
+        guard value.hasPrefix("data:image/jpeg;base64,"), value.count < 100_000,
+              let part = value.split(separator: ",", maxSplits: 1).last,
               let data = Data(base64Encoded: String(part)) else { return nil }
         return UIImage(data: data)
     }
+
+    func cached(_ value: String) -> UIImage? { memory.object(forKey: value as NSString) }
+
+    func image(for value: String) async -> UIImage? {
+        if let inline = Self.decodeInline(value) { return inline }
+        guard Self.isLink(value), let url = URL(string: value) else { return nil }
+        if let hit = cached(value) { return hit }
+        guard let (data, response) = try? await session.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              data.count < 2_000_000, let image = UIImage(data: data) else { return nil }
+        memory.setObject(image, forKey: value as NSString)
+        return image
+    }
+}
+
+struct FederationImage: View {
+    let dataURL: String?
+    var fallback = "person.crop.square"
+    @State private var loaded: UIImage?
+    var image: UIImage? {
+        guard let dataURL else { return nil }
+        return FederationImageStore.decodeInline(dataURL) ?? FederationImageStore.shared.cached(dataURL)
+    }
     var body: some View {
         Group {
-            if let image { Image(uiImage: image).resizable().scaledToFill() }
+            if let shown = image ?? loaded { Image(uiImage: shown).resizable().scaledToFill() }
             else { Image(systemName: fallback).resizable().scaledToFit().padding(8).opacity(0.45) }
-        }.clipped()
+        }
+        .clipped()
+        .task(id: dataURL) {
+            guard let dataURL, FederationImageStore.isLink(dataURL) else { loaded = nil; return }
+            loaded = await FederationImageStore.shared.image(for: dataURL)
+        }
     }
 }
 
@@ -1146,18 +1188,35 @@ struct FederationFeedRows: View {
     @State private var cursor: Int?
     @State private var loading = false
     @State private var error: String?
+    @State private var now = Date()
+    @State private var started = false
     var body: some View {
         Section {
             if loading { ProgressView().frame(maxWidth: .infinity) }
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                LazyVStack(alignment: .leading) {
-                    ForEach(posts.filter { $0.lease_until > context.date.timeIntervalSince1970 && !fed.deletedPosts.contains($0.id) }) { post in FederationPostCard(t: t, post: post).id(post.id) }
-                }
+            // One List row per post. (All posts in one row inside a LazyVStack left a blank
+            // gap when friends' older posts arrived: the row kept a stale height/lazy layout.)
+            ForEach(posts.filter { $0.lease_until > now.timeIntervalSince1970 && !fed.deletedPosts.contains($0.id) }) { post in
+                FederationPostCard(t: t, post: post)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+                    .listRowSeparator(.hidden)
             }
             if posts.isEmpty && !loading { Text("好友的新动态会出现在这里").font(.caption).foregroundStyle(t.textM) }
             if cursor != nil { Button("加载更多") { Task { await load(more: true) } }.disabled(loading) }
             if let error { Text(error).font(.caption).foregroundStyle(t.textM) }
-        }.listRowBackground(t.card).task { await load() }
+        }.listRowBackground(t.card)
+        // Modifiers on a List Section land on every row, and rows come and go (the spinner,
+        // posts scrolling by). Start once, detached from any row, so a row leaving can't
+        // cancel the request and a row appearing can't reset the feed to page one.
+        .task {
+            guard !started else { return }
+            started = true
+            Task { await load() }
+        }
+        // Hide posts whose lease lapsed; re-render only when one actually lapses.
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { date in
+            let then = now.timeIntervalSince1970, current = date.timeIntervalSince1970
+            if posts.contains(where: { $0.lease_until > then && $0.lease_until <= current }) { now = date }
+        }
     }
     private func load(more: Bool = false) async {
         guard !loading else { return }; loading = true; error = nil
@@ -1346,10 +1405,11 @@ struct FederationImageViewer: View {
     @Environment(\.dismiss) private var dismiss
     @State private var scale: CGFloat = 1
     @State private var settled: CGFloat = 1
+    @State private var loaded: UIImage?
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let image = FederationImage(dataURL: dataURL).image {
+            if let image = loaded ?? FederationImage(dataURL: dataURL).image {
                 Image(uiImage: image).resizable().scaledToFit()
                     .scaleEffect(scale)
                     .gesture(MagnifyGesture()
@@ -1362,6 +1422,7 @@ struct FederationImageViewer: View {
         .onTapGesture { dismiss() }
         .gesture(DragGesture().onEnded { if $0.translation.height > 80 && scale == 1 { dismiss() } })
         .accessibilityAddTraits(.isButton).accessibilityLabel("关闭大图")
+        .task { loaded = await FederationImageStore.shared.image(for: dataURL) }
     }
 }
 

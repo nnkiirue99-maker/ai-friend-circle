@@ -109,6 +109,9 @@ def make_host_proxy(
             "Origin": ui_origin,
             "Content-Type": "application/json",
         }
+        # The one client preference passed through: post pictures as links (fixed value only).
+        if request.headers.get("X-Federation-Media") == "links":
+            headers["X-Federation-Media"] = "links"
         body = request.stream.read(MAX_BODY + 1)
         if len(body) > MAX_BODY:
             raise FederationError("message_too_large", 413)

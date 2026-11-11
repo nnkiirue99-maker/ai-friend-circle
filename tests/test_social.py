@@ -637,3 +637,164 @@ def test_author_reads_original_scope_to_edit_without_changing_audience(nodes):
         a.social.update(
             a.person, only_b["id"], "旧版本", scope, only_b["revision"]
         )  # stale revision
+
+
+def test_feed_pictures_as_cacheable_links_only_when_asked(nodes):
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    from test_local_api import local_app
+    from test_relationships import connect, drain
+
+    a, b, _, _ = nodes
+    connect(a, b)
+    raw = BytesIO()
+    Image.new("RGB", (40, 30), "#c08a6b").save(raw, format="JPEG")
+    picture = "data:image/jpeg;base64," + base64.b64encode(raw.getvalue()).decode()
+    mine = a.social.publish(a.person, a.person, "我的图", SCOPE, [picture])
+    theirs = b.social.publish(b.person, b.person, "好友的图", SCOPE, [picture])
+    drain(a, b)
+    a.social.sync_feeds(reader=a.person)
+    app, public = local_app(a), a.http.apps["https://a.test"].test_client()
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["actor_id"] = a.person
+        # Old clients: unchanged inline pictures.
+        old = client.get("/api/federation/social/feed").get_json()["items"]
+        assert all(i["content"]["media"][0].startswith("data:image/") for i in old)
+        links = {"X-Federation-Media": "links"}
+        got = client.get("/api/federation/social/feed", headers=links)
+        assert "X-Federation-Media" in got.headers["Vary"] and b"base64," not in got.data
+        items = {i["id"]: i for i in got.get_json()["items"]}
+        assert set(items) >= {mine["id"], theirs["id"]}
+        again = client.get("/api/federation/social/feed", headers=links).get_json()["items"]
+        assert {i["id"]: i for i in again}[theirs["id"]] == items[theirs["id"]]  # stable URL
+        for post_id in (mine["id"], theirs["id"]):
+            [link] = items[post_id]["content"]["media"]
+            assert link.startswith("https://a.test/federation/media/")
+            shown = public.get(link.removeprefix("https://a.test"), headers={"Host": "a.test"})
+            assert shown.status_code == 200 and shown.mimetype == "image/jpeg"
+            assert "max-age=" in shown.headers["Cache-Control"]
+        # The web UI snapshot uses the same opt-in.
+        snap = client.get("/api/federation/ui/snapshot", headers=links)
+        assert snap.status_code == 200 and b"base64," not in snap.data
+        # Editing with the links we were given keeps the picture.
+        link = items[mine["id"]]["content"]["media"][0]
+        edited = client.put(
+            "/api/federation/social/posts",
+            json={
+                "id": mine["id"],
+                "text": "改了字",
+                "media": [link],
+                "scope": SCOPE,
+                "expected_revision": mine["revision"],
+            },
+            headers={"Origin": "https://ui.test", **links},
+        )
+        assert edited.status_code == 200, edited.get_json()
+        stored = a.social.object(a.person, mine["id"])
+        assert stored["content"]["text"] == "改了字"
+        assert stored["content"]["media"][0].startswith("data:image/jpeg;base64,")
+        # A link to another post's picture cannot be smuggled into an edit.
+        foreign = items[theirs["id"]]["content"]["media"][0]
+        bad = client.put(
+            "/api/federation/social/posts",
+            json={
+                "id": mine["id"],
+                "text": "x",
+                "media": [foreign],
+                "scope": SCOPE,
+                "expected_revision": stored["revision"],
+            },
+            headers={"Origin": "https://ui.test"},
+        )
+        assert bad.status_code == 400 and bad.get_json()["error"] == "invalid_media"
+    # Once the friendship ends, the cached copy and its picture link stop working.
+    with a.store.connect(write=True) as db:
+        db.execute("DELETE FROM object_cache WHERE reader=?", (a.person,))
+    gone = public.get(
+        items[theirs["id"]]["content"]["media"][0].removeprefix("https://a.test"),
+        headers={"Host": "a.test"},
+    )
+    assert gone.status_code == 404 and gone.headers["Cache-Control"] == "no-store"
+
+
+def test_refresh_skips_fresh_copies_and_one_down_server_does_not_block_others(nodes):
+    from test_relationships import connect, drain
+
+    a, b, c, mesh = nodes
+    connect(a, b)
+    connect(a, c)
+    for n in range(3):
+        b.social.publish(b.person, b.person, f"b{n}", SCOPE)
+    c.social.publish(c.person, c.person, "c0", SCOPE)
+    drain(a, b)
+    drain(a, c)
+    objects = lambda: sum(1 for m, u, _ in mesh.sent if u.endswith("/federation/social/object"))  # noqa: E731
+    a.social.sync_feeds(reader=a.person)
+    first = objects()
+    texts = {i["content"]["text"] for i in a.social.feed(a.person)["items"]}
+    assert {"b0", "b1", "b2", "c0"} <= texts
+    # Second refresh right away: profiles are re-checked, fresh post copies are not re-fetched.
+    result = a.social.sync_feeds(reader=a.person)
+    assert objects() == first and result["failed"] == 0
+    # Near lease expiry the origin is asked again.
+    with a.store.connect(write=True) as db:
+        db.execute("UPDATE object_cache SET expires=? WHERE reader=?", (time.time() + 30, a.person))
+    a.social.sync_feeds(reader=a.person)
+    assert objects() > first
+    # An offline server is skipped; the other friend still refreshes.
+    mesh.offline.add(b.config.origin)
+    result = a.social.sync_feeds(reader=a.person)
+    assert result["renewed"] >= 1 and result["failed"] >= 1
+
+
+def test_avatars_and_covers_as_links_survive_profile_edit(nodes):
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    from test_local_api import local_app
+
+    a, _, _, _ = nodes
+    raw = BytesIO()
+    Image.new("RGB", (32, 32), "#557766").save(raw, format="JPEG")
+    avatar = "data:image/jpeg;base64," + base64.b64encode(raw.getvalue()).decode()
+    a.social.set_profile(a.person, a.person, {"name": "我", "avatar": avatar}, 0)
+    app, public = local_app(a), a.http.apps["https://a.test"].test_client()
+    links = {"X-Federation-Media": "links"}
+    with app.test_client() as client:
+        with client.session_transaction() as sess:
+            sess["actor_id"] = a.person
+        snap = client.get("/api/federation/ui/snapshot", headers=links)
+        assert b"base64," not in snap.data
+        me = next(x for x in snap.get_json()["actors"] if x["id"] == a.person)
+        assert me["avatar"].startswith("https://a.test/federation/media/")
+        shown = public.get(me["avatar"].removeprefix("https://a.test"), headers={"Host": "a.test"})
+        assert shown.status_code == 200 and shown.mimetype == "image/jpeg"
+        saved = client.put(
+            "/api/federation/social/profile",
+            json={
+                "actor_id": a.person,
+                "expected_revision": me["revision"],
+                "profile": {"name": "新名字", "avatar": me["avatar"], "cover": None},
+            },
+            headers={"Origin": "https://ui.test", **links},
+        )
+        assert saved.status_code == 200, saved.get_json()
+        profile = a.social._profile(a.person)
+        assert profile["name"] == "新名字" and profile["avatar"].startswith("data:image/jpeg")
+        # A post-picture link or another actor's avatar link is not accepted as an avatar.
+        stranger = client.put(
+            "/api/federation/social/profile",
+            json={
+                "actor_id": a.ai,
+                "expected_revision": a.social._profile(a.ai)["revision"],
+                "profile": {"name": "x", "avatar": me["avatar"]},
+            },
+            headers={"Origin": "https://ui.test"},
+        )
+        assert stranger.status_code == 400 and stranger.get_json()["error"] == "invalid_media"

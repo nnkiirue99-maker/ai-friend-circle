@@ -88,6 +88,11 @@ def test_proxy_uses_authenticated_mapping_not_browser_claims(nodes, tmp_path):
         )
         assert response.json["actor_id"] == a.person
         assert sent[-1]["X-FC-Local-Principal"] == a.person
+        assert "X-Federation-Media" not in sent[-1]
+        client.get("/api/federation/social/feed", headers={"X-Federation-Media": "links"})
+        assert sent[-1]["X-Federation-Media"] == "links"
+        client.get("/api/federation/social/feed", headers={"X-Federation-Media": "inline; evil"})
+        assert "X-Federation-Media" not in sent[-1]
         assert (
             client.post(
                 "/api/federation/invitations", json={}, headers={"Origin": "https://evil.test"}

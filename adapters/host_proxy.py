@@ -100,6 +100,9 @@ def install(app, config_path=CONFIG, authenticated=None):
             "Origin": ui_origin,
             "Content-Type": "application/json",
         }
+        # The one client preference passed through: post pictures as links (fixed value only).
+        if request.headers.get("X-Federation-Media") == "links":
+            headers["X-Federation-Media"] = "links"
         conn = _Unix(socket_path)
         try:
             conn.request(

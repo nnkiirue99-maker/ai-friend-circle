@@ -286,7 +286,7 @@ class Tools:
 
     def federation_view_images(self, a):
         obj, pictures = readable_pictures(self.s, self.actor, a["post_id"])
-        links = [media_link(self.s, self.actor, a["post_id"], i)[0] for i in range(len(pictures))]
+        links = [media_link(self.s, self.actor, a["post_id"], d)[0] for _, d in pictures]
         return {
             "notice": UNTRUSTED,
             "post": self.post(obj),
