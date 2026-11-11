@@ -23,6 +23,11 @@ CAPABILITY = "private-profiles/1"
 # post's server lists only what that reader may see (instead of every author's id).
 VISIBILITY_CAPABILITY = "interaction-visibility/1"
 VISIBILITY_CACHE_SECONDS = 300
+# When the author's server cannot be asked, keep using its last answer for this long rather
+# than hiding the interaction (its body still comes from, and is refused by, that server).
+VISIBILITY_STALE_SECONDS = 24 * 3600
+# After a failed ask, wait this long before trying that origin again (no 10 s stall per refresh).
+VISIBILITY_RETRY_SECONDS = 60
 SOCIAL_TYPES = {"Create", "Update", "Delete", "Like", "Undo"}
 NOTIFICATION_SECONDS = 86400  # social notifications list only the last 24 hours
 THREAD_RESYNC_SECONDS = 120
@@ -57,6 +62,7 @@ class Social:
     def __init__(self, service):
         self.s, self.store = service, service.store
         self._visibility_cache, self._visibility_lock = {}, threading.Lock()
+        self._visibility_backoff = {}
 
     def authorize(self, principal, actor):
         self.s.visibility._authorize(principal, actor)
@@ -681,19 +687,35 @@ class Social:
         }
 
     def _ask_visibility(self, reader, root, rows):
-        """Ids among `rows` (interactions by other servers' authors) that `reader` may see."""
-        now, allowed, by_origin = time.time(), set(), {}
+        """Ids among `rows` (interactions by other servers' authors) that `reader` may see.
+
+        Answers are fresh for VISIBILITY_CACHE_SECONDS. Past that the author's server is asked
+        again; if it is slow or unreachable, its last answer stands (up to
+        VISIBILITY_STALE_SECONDS) so likes and comments do not flicker. Interactions it has
+        never answered for stay hidden until it does."""
+        now, allowed, by_origin, stale = time.time(), set(), {}, {}
         with self._visibility_lock:
-            for key in [k for k, (_, exp) in self._visibility_cache.items() if exp < now]:
+            for key in [k for k, v in self._visibility_cache.items() if v[2] < now]:
                 del self._visibility_cache[key]
             for r in rows:
                 hit = self._visibility_cache.get((r["id"], reader))
-                if hit:
+                if hit and hit[1] >= now:
                     if hit[0]:
                         allowed.add(r["id"])
-                else:
-                    by_origin.setdefault(origin_of(r["actor"]), []).append(r)
-        for group in by_origin.values():
+                    continue
+                if hit:
+                    stale[r["id"]] = hit[0]
+                by_origin.setdefault(origin_of(r["actor"]), []).append(r)
+
+        def fall_back(group):
+            allowed.update(r["id"] for r in group if stale.get(r["id"]))
+
+        for origin, group in by_origin.items():
+            with self._visibility_lock:
+                waiting = self._visibility_backoff.get(origin, 0) > now
+            if waiting:
+                fall_back(group)
+                continue
             try:
                 doc = self.s.identity.remote(group[0]["actor"])
             except FederationError:
@@ -710,13 +732,21 @@ class Social:
                 )
                 yes = set(result.get("visible", [])) & set(ids)
             except (FederationError, AttributeError, TypeError):
-                continue  # unreachable: list nothing now, ask again next time
+                with self._visibility_lock:
+                    self._visibility_backoff[origin] = now + VISIBILITY_RETRY_SECONDS
+                fall_back(group)  # unreachable: last known answers stand, ask again later
+                continue
             allowed |= yes
             with self._visibility_lock:
+                self._visibility_backoff.pop(origin, None)
                 if len(self._visibility_cache) > 20000:
                     self._visibility_cache.clear()
                 for i in ids:
-                    self._visibility_cache[(i, reader)] = (i in yes, now + VISIBILITY_CACHE_SECONDS)
+                    self._visibility_cache[(i, reader)] = (
+                        i in yes,
+                        now + VISIBILITY_CACHE_SECONDS,
+                        now + VISIBILITY_STALE_SECONDS,
+                    )
         return allowed
 
     def visible(self, caller, reader, ids):

@@ -900,7 +900,19 @@ def test_interaction_list_names_only_people_the_reader_may_see(tmp_path):
     mesh.offline.add(a.config.origin)
     assert a.person not in listed(c)[0]
     mesh.offline.discard(a.config.origin)
+    b.social._visibility_backoff.clear()  # the retry wait has passed
     assert a.person in listed(c)[0]
+    # Answer gone stale and a's server unreachable again: the last answers stand, both the
+    # "yes" for c and the "no" for d, instead of a's likes and comments flickering away.
+    for key, (ok, _, stale) in list(b.social._visibility_cache.items()):
+        b.social._visibility_cache[key] = (ok, 0, stale)
+    assert a.person not in listed(d)[0]
+    mesh.offline.add(a.config.origin)
+    assert a.person in listed(c)[0]
+    assert a.person not in listed(d)[0]
+    assert b.social._visibility_backoff  # and a's server is not re-asked on every refresh
+    mesh.offline.discard(a.config.origin)
+    b.social._visibility_backoff.clear()
     # An older peer without the capability: listed as before; its own server still refuses d.
     b.social._visibility_cache.clear()
     with b.store.connect(write=True) as db:
