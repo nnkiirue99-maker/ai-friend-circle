@@ -378,6 +378,33 @@ def test_ai_can_look_at_pictures_only_on_posts_it_may_see(nodes):
     assert Image.open(BytesIO(base64.b64decode(block["data"]))).size == (64, 48)
     assert "_images" not in result["content"][0]["text"]
 
+    # Same pictures as plain HTTPS links for clients that drop inline image blocks.
+    text = json.loads(result["content"][0]["text"])
+    assert text["image_urls_expire_in_seconds"] == 600
+    [link] = text["image_urls"]
+    assert link.startswith("https://b.test/federation/media/") and "base64" not in link
+    web = b.http.apps["https://b.test"].test_client()
+    path = link.removeprefix("https://b.test")
+    got = web.get(path, headers={"Host": "b.test"})
+    assert got.status_code == 200 and got.mimetype == "image/jpeg"
+    assert got.headers["Cache-Control"] == "no-store"
+    assert Image.open(BytesIO(got.data)).size == (64, 48)
+    # Tampered, expired, or revoked links all look the same: not found.
+    head, sig = path.rsplit(".", 2)[0], path.rsplit(".", 2)[1]
+    assert web.get(head + "." + sig[::-1] + ".jpg", headers={"Host": "b.test"}).status_code == 404
+    from friend_circle.media import media_link
+
+    expired, _ = media_link(b, b.ai, shared["id"], 0, now=time.time() - 3600)
+    assert (
+        web.get(expired.removeprefix("https://b.test"), headers={"Host": "b.test"}).status_code
+        == 404
+    )
+    forged, _ = media_link(b, b.ai, hidden["id"], 0)
+    assert (
+        web.get(forged.removeprefix("https://b.test"), headers={"Host": "b.test"}).status_code
+        == 404
+    )
+
     value, failed = bob.call("federation_view_images", post_id=hidden["id"])
     assert failed and "base64" not in json.dumps(value)
 

@@ -1,11 +1,12 @@
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from requests.structures import CaseInsensitiveDict
 from werkzeug.exceptions import HTTPException
 
 from .config import MAX_BODY, CONTENT_TYPE
 from .errors import FederationError
+from .media import open_media_link
 from .signatures import Message, verify
 from .store import decode
 from .onboarding import blueprint as onboarding_blueprint
@@ -100,6 +101,16 @@ def create_app(service):
                 )
             )
         raise FederationError("invalid_social_operation")
+
+    @app.get("/federation/media/<token>")
+    def media(token):
+        # Short-lived signed link a local AI received from federation_view_images. Every open
+        # re-checks that its reader may still see the post; no listing, no long-lived URL.
+        service.store.rate_limit("media:" + str(request.remote_addr), 60)
+        if len(token) > 4096:
+            raise FederationError("media_not_found", 404)
+        raw, mime = open_media_link(service, token)
+        return Response(raw, mimetype=mime)
 
     @app.get("/healthz")
     def health():
