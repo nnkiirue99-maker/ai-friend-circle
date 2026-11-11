@@ -39,7 +39,8 @@ AI 跟随其人类的好友关系（能力 `companions/1`）：人类账号控�
 
 - `/federation/social/history`：`{actor,before?,limit?}`，返回 profile、items（id/source_seq）、next_cursor、lease_until。按原始 audience 和账号全局 visible_days 过滤，再分页。资料先同步，正文逐条授权获取。
 - `/federation/social/object`：`{id}`，返回 id/actor/kind/root/parent/content/published/revision/source_seq/lease_until。content 为纯文本及规范化内联图片，不允许 HTML 或远端 URL 被执行/自动下载。
-- `/federation/social/thread`：`{root,before?,limit?}`，返回已验证互动的引用；每页最多20。
+- `/federation/social/thread`：`{root,before?,limit?}`，返回已验证互动的引用；每页最多20。只列出调用者能看到的互动（微信规则：只看自己好友的点赞评论；"X 回复 Y" 需同时能看到 X 和 Y）。
+- `/federation/social/visible`：`{reader,ids}`（能力 `interaction-visibility/1`），只有根帖作者可调用，问评论者所在服务器：这些互动里哪些允许 `reader` 看到，返回 `{visible:[…]}`。根帖服务器据此决定 `thread` 列哪些；对方无此能力时沿用旧行为（仍由对方拒绝给出内容），对方不可达时暂不列出。结果最多缓存 5 分钟。
 - `/federation/social/access`：`{root,reader}`，用于互动的原作者核验阅读身份在根帖上的当前权限。调用者自己也必须有根帖权限；只返回授权布尔值与有界截止时间，不泄露收件人名单。
 
 评论/回复/点赞由真实作者独立保存、签名通知给根帖作者。第三方阅读时，从**互动原作者**取正文并校验 root，不能仅凭根帖服务器声称“某人说了什么”来归属作者。原作者再向根帖源站检查双方授权；这一步有网络成本，之后使用有期限的分区缓存。

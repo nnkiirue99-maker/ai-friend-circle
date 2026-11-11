@@ -6,6 +6,7 @@ actual author's origin, never attributed using another server's assertion.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+import threading
 from datetime import datetime, timezone
 import time
 import uuid
@@ -18,6 +19,10 @@ from .signatures import sign
 from .store import encode, decode
 
 CAPABILITY = "private-profiles/1"
+# A commenter's server answers whether a given reader may see its interactions, so a
+# post's server lists only what that reader may see (instead of every author's id).
+VISIBILITY_CAPABILITY = "interaction-visibility/1"
+VISIBILITY_CACHE_SECONDS = 300
 SOCIAL_TYPES = {"Create", "Update", "Delete", "Like", "Undo"}
 NOTIFICATION_SECONDS = 86400  # social notifications list only the last 24 hours
 THREAD_RESYNC_SECONDS = 120
@@ -51,6 +56,7 @@ def page(before, limit):
 class Social:
     def __init__(self, service):
         self.s, self.store = service, service.store
+        self._visibility_cache, self._visibility_lock = {}, threading.Lock()
 
     def authorize(self, principal, actor):
         self.s.visibility._authorize(principal, actor)
@@ -657,17 +663,86 @@ class Social:
             "SELECT rowid AS seq,* FROM social_references WHERE root=? AND rowid<? ORDER BY rowid DESC LIMIT ?",
             (root, before, limit + 1),
         )
-        # Do not even list interactions this server knows the reader may not see. Authors on
-        # other servers are listed; their own server decides and refuses the body.
+        # List only interactions the reader may see. This server decides for its own
+        # identities; for authors elsewhere it asks the author's server (see `visible`).
+        page_rows = rows[:limit]
+        decided = {r["id"]: self.sees_actor(reader, r["actor"], root) for r in page_rows}
+        asked = self._ask_visibility(
+            reader, root, [r for r in page_rows if decided[r["id"]] is None]
+        )
         return {
             "root": root,
             "items": [
                 {"id": r["id"], "actor": r["actor"], "kind": r["kind"]}
-                for r in rows[:limit]
-                if self.sees_actor(reader, r["actor"], root) is not False
+                for r in page_rows
+                if decided[r["id"]] or (decided[r["id"]] is None and r["id"] in asked)
             ],
             "next_cursor": rows[limit - 1]["seq"] if len(rows) > limit else None,
         }
+
+    def _ask_visibility(self, reader, root, rows):
+        """Ids among `rows` (interactions by other servers' authors) that `reader` may see."""
+        now, allowed, by_origin = time.time(), set(), {}
+        with self._visibility_lock:
+            for key in [k for k, (_, exp) in self._visibility_cache.items() if exp < now]:
+                del self._visibility_cache[key]
+            for r in rows:
+                hit = self._visibility_cache.get((r["id"], reader))
+                if hit:
+                    if hit[0]:
+                        allowed.add(r["id"])
+                else:
+                    by_origin.setdefault(origin_of(r["actor"]), []).append(r)
+        for group in by_origin.values():
+            try:
+                doc = self.s.identity.remote(group[0]["actor"])
+            except FederationError:
+                continue  # unknown or blocked: list nothing from there
+            if VISIBILITY_CAPABILITY not in doc.get("rb:features", []):
+                # Older peer cannot answer; keep the earlier behaviour (its own server still
+                # refuses the body) so friends in common do not lose each other's comments.
+                allowed.update(r["id"] for r in group)
+                continue
+            ids = [r["id"] for r in group]
+            try:
+                result = self._rpc(
+                    actor_of(root), group[0]["actor"], "visible", {"reader": reader, "ids": ids}
+                )
+                yes = set(result.get("visible", [])) & set(ids)
+            except (FederationError, AttributeError, TypeError):
+                continue  # unreachable: list nothing now, ask again next time
+            allowed |= yes
+            with self._visibility_lock:
+                if len(self._visibility_cache) > 20000:
+                    self._visibility_cache.clear()
+                for i in ids:
+                    self._visibility_cache[(i, reader)] = (i in yes, now + VISIBILITY_CACHE_SECONDS)
+        return allowed
+
+    def visible(self, caller, reader, ids):
+        """Answer for the server of a post: which of our interactions under it may `reader`
+        see? Only that post's author may ask, and only about interactions under its posts."""
+        if (
+            not isinstance(reader, str)
+            or len(reader) > 2048
+            or not isinstance(ids, list)
+            or not 1 <= len(ids) <= 50
+            or any(not isinstance(i, str) or len(i) > 2048 for i in ids)
+        ):
+            raise FederationError("invalid_visibility_request")
+        out = []
+        for identifier in ids:
+            row = self.store.one(
+                "SELECT * FROM social_objects WHERE id=? AND kind IN ('comment','like') AND deleted=0",
+                (identifier,),
+            )
+            if not row or actor_of(row["root"]) != caller:
+                continue
+            if self.may_see_interaction(row["actor"], row["root"], reader) and (
+                self.reply_visible(reader, dict(row)) is not False
+            ):
+                out.append(identifier)
+        return {"visible": out}
 
     def _validated_object(self, result, identifier):
         actor = actor_of(identifier)

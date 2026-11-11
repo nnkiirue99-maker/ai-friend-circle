@@ -14,7 +14,7 @@ from .relationships import Relationships, TYPES, COMPANIONS_CAPABILITY
 from .audience import AccountVisibility
 from .invitations import Invitations, CAPABILITY as INVITATIONS_CAPABILITY
 from .groups import Groups
-from .social import Social, SOCIAL_TYPES, CAPABILITY as SOCIAL_CAPABILITY
+from .social import Social, SOCIAL_TYPES, CAPABILITY as SOCIAL_CAPABILITY, VISIBILITY_CAPABILITY
 
 
 class Federation:
@@ -53,6 +53,7 @@ class Federation:
                 COMPANIONS_CAPABILITY,
                 INVITATIONS_CAPABILITY,
                 SOCIAL_CAPABILITY,
+                VISIBILITY_CAPABILITY,
             ],
             "activity_types": ["rb:Probe"] + sorted(TYPES | SOCIAL_TYPES),
             "limits": {"max_event_bytes": MAX_BODY, "max_signature_age_seconds": 300},

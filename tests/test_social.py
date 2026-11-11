@@ -849,3 +849,65 @@ def test_wechat_rule_replies_need_both_people_visible(tmp_path):
     # The source refuses what it can decide: d's server cannot fetch a's comment itself.
     with pytest.raises(FederationError):
         d.social.fetch(d.person, by_a["id"])
+
+
+def test_interaction_list_names_only_people_the_reader_may_see(tmp_path):
+    from conftest import MemoryMesh
+    from friend_circle.app import create_app
+    from friend_circle.config import Config
+    from friend_circle.service import Federation
+    from friend_circle.signatures import sign
+    from friend_circle.store import decode, encode
+
+    mesh, n = MemoryMesh(), {}
+    for name in "abcd":
+        s = Federation(Config(f"https://{name}.test", tmp_path / name), mesh)
+        s.person = s.identity.create("p" + name)["id"]
+        s.ai = s.identity.create("ai" + name, "ai", s.person)["id"]
+        mesh.apps[s.config.origin] = create_app(s)
+        n[name] = s
+    a, b, c, d = n["a"], n["b"], n["c"], n["d"]
+    connect(b, a), connect(b, c), connect(b, d), connect(a, c)
+    root = post(b, "b 的动态")
+    drain(a, b, c, d)
+    for x in (a, c, d):
+        x.social.refresh(x.person, b.person)
+    like = a.social.interact(a.person, a.person, root["id"], "like")
+    by_a = a.social.interact(a.person, a.person, root["id"], "comment", "a")
+    by_d = d.social.interact(d.person, d.person, root["id"], "comment", "d")
+    drain(a, b, c, d)
+
+    def listed(node):
+        refs = node.social._rpc(node.person, b.person, "thread", {"root": root["id"]})
+        return {x["actor"] for x in refs["items"]}, {x["id"] for x in refs["items"]}
+
+    actors, _ = listed(d)
+    assert a.person not in actors and d.person in actors  # d's server never learns of a
+    _, ids = listed(c)
+    assert {like["id"], by_a["id"]} <= ids and by_d["id"] not in ids
+    # Only the post's author may ask a's server; d asking about a's comment learns nothing.
+    msg = sign(
+        d.identity,
+        d.person,
+        "POST",
+        "https://a.test/federation/social/visible",
+        encode({"reader": d.person, "ids": [by_a["id"]]}).encode(),
+    )
+    reply = mesh.send(msg.method, msg.url, msg.headers, msg.body)
+    assert reply.status == 200 and reply.json() == {"visible": []}
+    # a's server offline: its interactions are not listed (nor cached as allowed) meanwhile.
+    b.social._visibility_cache.clear()
+    mesh.offline.add(a.config.origin)
+    assert a.person not in listed(c)[0]
+    mesh.offline.discard(a.config.origin)
+    assert a.person in listed(c)[0]
+    # An older peer without the capability: listed as before; its own server still refuses d.
+    b.social._visibility_cache.clear()
+    with b.store.connect(write=True) as db:
+        row = db.execute("SELECT document FROM remote_actors WHERE id=?", (a.person,)).fetchone()
+        doc = decode(row[0])
+        doc["rb:features"] = [f for f in doc["rb:features"] if f != "interaction-visibility/1"]
+        db.execute("UPDATE remote_actors SET document=? WHERE id=?", (encode(doc), a.person))
+    assert a.person in listed(d)[0]
+    with pytest.raises(FederationError):
+        d.social.fetch(d.person, by_a["id"])

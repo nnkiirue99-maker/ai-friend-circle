@@ -94,6 +94,8 @@ def create_app(service):
             )
         if operation == "object" and set(obj) == {"id"}:
             return jsonify(service.social.object(doc["id"], obj["id"]))
+        if operation == "visible" and set(obj) == {"reader", "ids"}:
+            return jsonify(service.social.visible(doc["id"], obj["reader"], obj["ids"]))
         if operation == "access" and set(obj) == {"root", "reader"}:
             return jsonify(service.social.access(doc["id"], obj["root"], obj["reader"]))
         if operation == "thread" and set(obj) <= {"root", "before", "limit"} and "root" in obj:
