@@ -721,6 +721,7 @@ struct FederationPostCard: View {
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                                     Image(systemName: "heart").font(.system(size: 13, weight: .medium)).foregroundStyle(t.textS)
                                     Text(likeNames(likes)).font(.system(size: 14)).lineSpacing(3)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                                 .padding(.horizontal, 10).padding(.vertical, 8)
                             }
@@ -855,7 +856,10 @@ struct FederationPostCard: View {
         var line = nameRun(item.actor)
         if let target = replyTarget(item) { line += plainRun("回复") + nameRun(target) }
         line += plainRun(": " + item.content.text)
+        // fixedSize: inside a List row the box is laid out before the thread loads; without it
+        // long comments were squeezed to one line with "…" instead of wrapping.
         return Text(line).font(.system(size: 14)).lineSpacing(3)
+            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture {
