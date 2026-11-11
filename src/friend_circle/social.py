@@ -94,6 +94,28 @@ class Social:
             return True
         return self.s.relationships.is_friend(author, reader)
 
+    def sees_actor(self, reader, other, root):
+        """May `reader` see interactions by `other` under `root`? True/False when this server
+        can tell (one of the two is local here), None when only another server knows."""
+        if reader == other or reader == actor_of(root):
+            return True
+        if self.controls(reader, other) or self.controls(other, reader):
+            return True
+        if self.local(other):
+            return self.may_see_interaction(other, root, reader)
+        if self.local(reader):
+            human = self.controller(reader)  # an AI follows its human's friendships
+            return any(self.s.relationships.is_friend(x, other) for x in (reader, human) if x)
+        return None
+
+    def reply_visible(self, reader, item):
+        """WeChat rule for replies: "X 回复 Y" is shown only to someone who may see both
+        X and Y. X is checked by X's own server; this checks Y wherever it can be decided."""
+        parent = item.get("parent")
+        if not parent or parent == item.get("root"):
+            return True
+        return self.sees_actor(reader, actor_of(parent), item["root"]) is not False
+
     def own_authors(self, reader):
         """The identities whose posts belong in this reader's own timeline: itself, plus the
         AIs it controls, or the associated human when the reader is an AI."""
@@ -309,7 +331,9 @@ class Social:
             return self._payload(row, reader)
         if row["deleted"]:
             raise FederationError("object_not_found", 404)
-        if not self.may_see_interaction(row["actor"], row["root"], reader):
+        if not self.may_see_interaction(row["actor"], row["root"], reader) or not (
+            self.reply_visible(reader, dict(row))
+        ):
             raise FederationError("object_forbidden", 403)
         access = self.root_access(row["actor"], row["root"], reader)
         result = self._payload(row, reader)
@@ -633,10 +657,14 @@ class Social:
             "SELECT rowid AS seq,* FROM social_references WHERE root=? AND rowid<? ORDER BY rowid DESC LIMIT ?",
             (root, before, limit + 1),
         )
+        # Do not even list interactions this server knows the reader may not see. Authors on
+        # other servers are listed; their own server decides and refuses the body.
         return {
             "root": root,
             "items": [
-                {"id": r["id"], "actor": r["actor"], "kind": r["kind"]} for r in rows[:limit]
+                {"id": r["id"], "actor": r["actor"], "kind": r["kind"]}
+                for r in rows[:limit]
+                if self.sees_actor(reader, r["actor"], root) is not False
             ],
             "next_cursor": rows[limit - 1]["seq"] if len(rows) > limit else None,
         }
@@ -964,6 +992,7 @@ class Social:
                     if row["id"] not in known:
                         fetched_items.append(self._payload(row, reader))
                 fetched_items.sort(key=lambda x: x["published"], reverse=True)
+            fetched_items = [x for x in fetched_items if self.reply_visible(reader, x)]
             return {"root": root, "items": fetched_items, "next_cursor": next_cursor}
         rows = self.store.all(
             "SELECT body FROM object_cache WHERE reader=? AND root=? AND kind IN ('comment','like') AND expires>? ORDER BY synced DESC LIMIT ?",
@@ -978,7 +1007,7 @@ class Social:
             (root, limit) if self.local(owner) else (root, *authors, limit),
         ):
             objects.append(self._payload(row, reader))
-        unique = {x["id"]: x for x in objects}
+        unique = {x["id"]: x for x in objects if self.reply_visible(reader, x)}
         return {
             "root": root,
             "items": sorted(unique.values(), key=lambda x: x["published"], reverse=True)[:limit],

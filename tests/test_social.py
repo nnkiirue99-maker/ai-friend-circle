@@ -798,3 +798,54 @@ def test_avatars_and_covers_as_links_survive_profile_edit(nodes):
             headers={"Origin": "https://ui.test"},
         )
         assert stranger.status_code == 400 and stranger.get_json()["error"] == "invalid_media"
+
+
+def test_wechat_rule_replies_need_both_people_visible(tmp_path):
+    from conftest import MemoryMesh
+    from friend_circle import projection
+    from friend_circle.app import create_app
+    from friend_circle.config import Config
+    from friend_circle.service import Federation
+
+    mesh, n = MemoryMesh(), {}
+    for name in "abcd":
+        s = Federation(Config(f"https://{name}.test", tmp_path / name), mesh)
+        s.person = s.identity.create("p" + name)["id"]
+        s.ai = s.identity.create("ai" + name, "ai", s.person)["id"]
+        mesh.apps[s.config.origin] = create_app(s)
+        n[name] = s
+    a, b, c, d = n["a"], n["b"], n["c"], n["d"]
+    # b posts and is friends with everyone; a and c are mutual friends; d knows only b.
+    connect(b, a), connect(b, c), connect(b, d), connect(a, c)
+    root = post(b, "b 的动态")
+    drain(a, b, c, d)
+    for x in (a, c, d):
+        x.social.refresh(x.person, b.person)
+    by_a = a.social.interact(a.person, a.person, root["id"], "comment", "a")
+    by_d = d.social.interact(d.person, d.person, root["id"], "comment", "d")
+    drain(a, b, c, d)
+    to_a = b.social.interact(b.person, b.person, root["id"], "comment", "回复 a", by_a["id"])
+    to_d = b.social.interact(b.person, b.person, root["id"], "comment", "回复 d", by_d["id"])
+    to_a_by_ai = b.social.interact(b.ai, b.ai, root["id"], "comment", "AI 回复 a", by_a["id"])
+    drain(a, b, c, d)
+
+    def seen(node, reader=None):
+        items = node.social.thread(reader or node.person, root["id"], refresh=True)["items"]
+        return {x["id"] for x in items}
+
+    assert seen(b) == {by_a["id"], by_d["id"], to_a["id"], to_d["id"], to_a_by_ai["id"]}
+    # c is a's friend, not d's: sees a, the replies to a, and nothing about d.
+    assert seen(c) == {by_a["id"], to_a["id"], to_a_by_ai["id"]}
+    assert seen(c, c.ai) == seen(c)  # an AI follows its human's friendships
+    # d is not a's friend: neither a's comment nor b's replies to a.
+    assert seen(d) == {by_d["id"], to_d["id"]}
+    # a sees the replies addressed to it, not those to d.
+    assert seen(a) == {by_a["id"], to_a["id"], to_a_by_ai["id"]}
+    # d's UI never learns a's identity through a reply.
+    snap = projection.snapshot(d, d.person)
+    shown = next(p for p in snap["posts"] if p["id"] == root["id"])
+    assert a.person not in {x["replyActor"] for x in shown["comments"]}
+    assert a.person not in {x["id"] for x in snap["actors"]}
+    # The source refuses what it can decide: d's server cannot fetch a's comment itself.
+    with pytest.raises(FederationError):
+        d.social.fetch(d.person, by_a["id"])
