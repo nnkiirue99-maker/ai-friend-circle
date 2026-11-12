@@ -257,9 +257,20 @@ class Relationships:
                     (row["id"],),
                 )
 
+    def _owner(self, db, local, remote):
+        """A friend's AI belongs to that friend: acting on the AI acts on its human's friendship."""
+        row = db.execute(
+            "SELECT g.remote_human FROM friendship_groups g, json_each(g.remote_ai) j "
+            "WHERE g.local_human=? AND j.value=? ORDER BY g.status='active' DESC, g.rowid DESC LIMIT 1",
+            (local, remote),
+        ).fetchone()
+        return row[0] if row else remote
+
     def remove(self, local, remote, *, block=False):
+        """Unfriend or block a human together with all of their AIs (removing an AI means its human)."""
         self._human(local)
         with self.store.connect(write=True) as db:
+            remote = self._owner(db, local, remote)
             if block:
                 db.execute("INSERT OR IGNORE INTO contact_blocks VALUES (?,?)", (local, remote))
             groups = db.execute(
@@ -290,6 +301,7 @@ class Relationships:
     def unblock(self, local, remote):
         self._human(local)
         with self.store.connect(write=True) as db:
+            remote = self._owner(db, local, remote)
             db.execute("DELETE FROM contact_blocks WHERE owner=? AND remote=?", (local, remote))
 
     def prepare(self, event):

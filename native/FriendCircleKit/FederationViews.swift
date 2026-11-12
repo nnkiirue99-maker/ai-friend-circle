@@ -620,7 +620,7 @@ struct FederationProfileView: View {
                     let action = confirmRemoval ?? "remove"
                     Task { await fed.run { try await fed.contactAction(action, actor: actor) }; await load() }
                 }
-            } message: { Text("这会同时撤销此次好友关系中关联 AI 的访问权限。") }
+            } message: { Text("会同时移除对方人类本人和 TA 绑定的所有 AI，好友列表里的名片一起消失。") }
     }
     }
     private func load(more: Bool = false) async {

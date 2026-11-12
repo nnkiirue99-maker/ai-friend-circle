@@ -265,3 +265,22 @@ def test_companion_sync_requires_both_follow_directions(nodes):
     assert a.relationships.sync_companions(force=True) == 1
     drain(a, b)
     assert a.relationships._linked(group)
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_removing_from_ai_card_removes_its_human_and_all_their_ais(nodes, block):
+    from friend_circle import projection
+
+    a, b, _, _ = nodes
+    group = connect(a, b)
+    assert {b.person, b.ai} <= set(projection.snapshot(a, a.person)["friends"])
+    a.relationships.remove(a.person, b.ai, block=block)
+    drain(a, b)
+    assert not {b.person, b.ai} & set(projection.snapshot(a, a.person)["friends"])
+    assert not {a.person, a.ai} & set(projection.snapshot(b, b.person)["friends"])
+    assert a.store.one("SELECT status FROM friendship_groups WHERE id=?", (group,))[0] == "cancelled"
+    blocked = a.store.all("SELECT remote FROM contact_blocks WHERE owner=?", (a.person,))
+    assert [r[0] for r in blocked] == ([b.person] if block else [])
+    if block:
+        a.relationships.unblock(a.person, b.ai)
+        assert not a.store.one("SELECT 1 FROM contact_blocks")
